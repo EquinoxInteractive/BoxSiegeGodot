@@ -850,7 +850,11 @@ static func load_save() -> Dictionary:
 	var f_ch: int = int(cfg.get_value("fighter", "character", -1))
 	var f_wp: String = String(cfg.get_value("fighter", "weapon", ""))
 	if f_ch >= 0 and f_wp != "":
-		data["fighter"] = {"character": f_ch, "weapon": f_wp}
+		var fgt: Dictionary = {"character": f_ch, "weapon": f_wp}
+		for k in FIGHTER_LOOK_KEYS:
+			if cfg.has_section_key("fighter", k):
+				fgt[k] = String(cfg.get_value("fighter", k, ""))
+		data["fighter"] = fgt
 	var run_v: Variant = cfg.get_value("run", "data", {})
 	if run_v is Dictionary and not (run_v as Dictionary).is_empty():
 		var r: Dictionary = (run_v as Dictionary).duplicate(true)
@@ -883,6 +887,10 @@ static func save_all(data: Dictionary) -> void:
 	if not fighter.is_empty():
 		cfg.set_value("fighter", "character", int(fighter["character"]))
 		cfg.set_value("fighter", "weapon", String(fighter["weapon"]))
+		# skin karakter + skin senjata (utama / pistol / pisau) ikut ditulis ke file save
+		for k in FIGHTER_LOOK_KEYS:
+			if fighter.has(k):
+				cfg.set_value("fighter", k, String(fighter[k]))
 	cfg.save(SAVE_PATH)
 
 
@@ -902,10 +910,18 @@ static func record_result(level_n: int, stars: int, score_gain: int, total_score
 	save_all(data)
 
 
+const FIGHTER_LOOK_KEYS := ["skin", "wskin", "pskin", "kskin"]
+
+
 ## Karakter & senjata CAMPAIGN yang terakhir dipilih (tersimpan di save, jadi tidak perlu memilih lagi).
-static func save_fighter(character: int, weapon: String) -> void:
+## `looks` = entri pilihan dari layar select ({"skin", "wskin", "pskin", "kskin", ...}): skin karakter & skin senjata
+## (utama, pistol, pisau) ikut disimpan supaya CAMPAIGN memakai tampilan yang sama dengan yang dipilih (bukan cuma karakter + senjata).
+static func save_fighter(character: int, weapon: String, looks: Dictionary = {}) -> void:
 	var data: Dictionary = load_save()
-	data["fighter"] = {"character": character, "weapon": weapon}
+	var f: Dictionary = {"character": character, "weapon": weapon}
+	for k in FIGHTER_LOOK_KEYS:
+		f[k] = String(looks.get(k, ""))
+	data["fighter"] = f
 	save_all(data)
 
 
@@ -920,7 +936,19 @@ static func saved_fighter() -> Dictionary:
 		return {}
 	if not Global.WEAPON_ORDER.has(wp) or not bool(Global.WEAPONS[wp]["enabled"]):
 		return {}
-	return {"character": ch, "weapon": wp}
+	var res: Dictionary = {"character": ch, "weapon": wp}
+	# skin hanya disertakan kalau memang tersimpan (save lama tidak punya): tanpa kunci "skin" = pakai skin terakhir karakter itu
+	for k in FIGHTER_LOOK_KEYS:
+		if f.has(k):
+			res[k] = String(f[k])
+	# save lama (belum menyimpan skin senjata): pakai skin senjata terakhir yang dipilih di layar select
+	if not f.has("wskin"):
+		res["wskin"] = Cosmetics.last_wskin(wp)
+	if not f.has("pskin"):
+		res["pskin"] = Cosmetics.last_wskin("pistol")
+	if not f.has("kskin"):
+		res["kskin"] = Cosmetics.last_wskin("knife")
+	return res
 
 
 static func save_run(run: Dictionary) -> void:

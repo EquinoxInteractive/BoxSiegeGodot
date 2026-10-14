@@ -67,6 +67,9 @@ var portal_cd: Dictionary = {}                    # instance id pemain -> sisa j
 var ice_rects: Array[Rect2] = []
 var traps_root: Node2D          # tempat panah jebakan (dibersihkan tiap ronde)
 
+# --- replay (lihat scripts/replay_recorder.gd): hanya versus, aktif kalau REPLAY RECORDING = ON
+var rec: ReplayRecorder = null
+
 
 func _ready() -> void:
 	process_mode = Node.PROCESS_MODE_ALWAYS   # supaya ESC bisa un-pause; isi dunia di-set PAUSABLE
@@ -85,6 +88,7 @@ func _ready() -> void:
 	_build_players()
 	_build_hud()
 	_build_overlay()
+	_setup_replay()
 	_start_round()
 
 
@@ -547,6 +551,12 @@ func _process(delta: float) -> void:
 
 func _exit_tree() -> void:
 	Engine.time_scale = 1.0
+	# match ditinggalkan di tengah jalan: simpan sebagai replay "UNFINISHED" kalau diaktifkan di pengaturan replay
+	if rec != null and rec.active:
+		if ReplayStore.keep_unfinished and rec.duration() > 3.0:
+			_save_replay(false, -1, "")
+		else:
+			rec = null
 
 
 # ================================================================== kartu kemenangan TIM
@@ -676,6 +686,8 @@ class TimerHud extends Control:
 	var sd: bool = false
 	var pop: float = 1.0
 	var t: float = 0.0
+	var wins_to_show: int = -1          # REPLAY: target kemenangan milik replay (-1 = pengaturan game sekarang)
+	var sub_override: String = ""       # REPLAY: teks kecil pengganti "FIRST TO N WINS" (mis. "ROUND 2")
 
 	func _init() -> void:
 		size = Vector2(230, 96)
@@ -715,7 +727,10 @@ class TimerHud extends Control:
 		else:
 			UIKit.text_in(self, text, Rect2(-100, -35, 200, 70), 64, col, HORIZONTAL_ALIGNMENT_CENTER, 8, Color.BLACK, Global.font_digital)
 		draw_set_transform(Vector2.ZERO)
-		var rl: String = "SUDDEN DEATH" if sd else "FIRST TO %d WINS" % Global.WINS_TO_MATCH
+		var wtm: int = wins_to_show if wins_to_show > 0 else Global.WINS_TO_MATCH
+		var rl: String = "SUDDEN DEATH" if sd else "FIRST TO %d WINS" % wtm
+		if sub_override != "" and not sd:
+			rl = sub_override
 		UIKit.text_in(self, rl, Rect2(0, 72, w, 24), 18, Color(UIKit.RED if sd else Color(1, 1, 1, 0.75)), HORIZONTAL_ALIGNMENT_CENTER, 5)
 
 
@@ -746,6 +761,9 @@ class PlayerHud extends Control:
 	var sub_text: String = ""               # campaign: teks kecil di bawah hati (mis. SCORE)
 	var team_id: int = -1                   # versus tim: nomor tim (-1 = tanpa tim)
 	var team_level: int = 0                 # versus tim: level nerf (0 = seimbang)
+	var wins_to_show: int = -1              # REPLAY: target kemenangan milik replay (-1 = pengaturan game sekarang)
+	var kills: int = -1                     # REPLAY: >= 0 menampilkan jumlah kill di bawah potret
+	var silent: bool = false                # REPLAY: true = tanpa suara pip kemenangan (saat loncat waktu / kecepatan tinggi)
 
 	func _init(i: int = 0, p: Player = null) -> void:
 		idx = i
@@ -768,9 +786,28 @@ class PlayerHud extends Control:
 		last_hp = player.hp
 		if w > last_wins:
 			win_pop = 1.0
-			Global.play_sfx("win_pip", -4.0)
+			if not silent:
+				Global.play_sfx("win_pip", -4.0)
 			UIKit.tw(self).tween_property(self, "win_pop", 0.0, 0.7).set_trans(Tween.TRANS_BACK)
 		last_wins = w
+		queue_redraw()
+
+	## REPLAY: samakan semua animasi dengan keadaan sekarang tanpa efek (dipanggil setelah loncat waktu).
+	func snap(w: int) -> void:
+		wins = w
+		last_wins = w
+		hp_shown = player.hp
+		last_hp = player.hp
+		hurt = 0.0
+		shake_x = 0.0
+		win_pop = 0.0
+		last_weapon = player.current_weapon()
+		last_ammo = player.ammo
+		ammo_pop = 0.0
+		weapon_pop = 0.0
+		ammo_shown = _ammo_frac()
+		pu_last.clear()
+		pu_pop.clear()
 		queue_redraw()
 
 	func _process(d: float) -> void:
@@ -827,11 +864,29 @@ class PlayerHud extends Control:
 		if team_id >= 0:
 			var tcol: Color = Global.team_color(team_id)
 			var ta: float = 1.0 if alive else 0.45
-			var br := Rect2(18.0, 92.0, 58.0, 26.0)
+			# kalau kartu juga menampilkan kill (replay), lencana tim dipersempit supaya keduanya muat di bawah potret
+			var br := Rect2(19.0, 92.0, 34.0 if kills >= 0 else 58.0, 26.0)
+			if kills < 0:
+				br.position.x = 18.0
 			var bp := UIKit.slanted(br.size.x, br.size.y, 8.0, br.position.x, br.position.y)
 			draw_colored_polygon(bp, Color(tcol.darkened(0.55), 0.95 * ta))
 			draw_polyline(UIKit.closed(bp), Color(tcol, ta), 2.0, true)
-			UIKit.text_in(self, "T%d" % (team_id + 1), br, 19, Color(1, 1, 1, ta), HORIZONTAL_ALIGNMENT_CENTER, 4)
+			UIKit.text_in(self, "T%d" % (team_id + 1), br, 19 if kills < 0 else 17, Color(1, 1, 1, ta), HORIZONTAL_ALIGNMENT_CENTER, 4)
+		# REPLAY: jumlah kill. Selalu di dalam kartu (di bawah potret); ukuran huruf mengecil otomatis kalau angkanya panjang.
+		if kills >= 0:
+			var ka: float = 1.0 if alive else 0.45
+			var kr := Rect2(19.0, 92.0, 72.0, 26.0)
+			var klabel: String = "KILLS %d" % kills
+			if team_id >= 0:
+				kr = Rect2(57.0, 92.0, 34.0, 26.0)
+				klabel = "K%d" % kills
+			var kfs: int = 17
+			while kfs > 9 and UIKit.text_w(klabel, kfs) > kr.size.x - 16.0:
+				kfs -= 1
+			var kp := UIKit.slanted(kr.size.x, kr.size.y, 8.0, kr.position.x, kr.position.y)
+			draw_colored_polygon(kp, Color(0.0, 0.0, 0.0, 0.55 * ka))
+			draw_polyline(UIKit.closed(kp), Color(1, 1, 1, 0.35 * ka), 2.0, true)
+			UIKit.text_in(self, klabel, kr, kfs, Color(1, 1, 1, 0.9 * ka), HORIZONTAL_ALIGNMENT_CENTER, 3)
 		# nama
 		var tx: float = 104.0
 		# nama karakter yang dipakai pemain ini (bukan "PLAYER N"); font mengecil otomatis kalau namanya panjang
@@ -859,7 +914,7 @@ class PlayerHud extends Control:
 		draw_set_transform(Vector2(shake_x, 0))
 		# kemenangan
 		# jarak kotak kemenangan menyesuaikan jumlah round (sampai 5) supaya tidak keluar dari panel
-		var n_win: int = Global.WINS_TO_MATCH if show_wins else 0
+		var n_win: int = (wins_to_show if wins_to_show > 0 else Global.WINS_TO_MATCH) if show_wins else 0
 		var win_step: float = minf(32.0, (w - tx - 22.0 + 8.0) / float(maxi(n_win, 1)))
 		var win_w: float = minf(24.0, win_step - 8.0)
 		if sub_text != "":
@@ -1364,6 +1419,8 @@ func _unhandled_input(event: InputEvent) -> void:
 # ------------------------------------------------------------------ round flow
 func _start_round() -> void:
 	round_num += 1
+	if rec != null:
+		rec.on_round_start(round_num)
 	state = State.INTRO
 	intro_stage = 0
 	state_timer = 1.8
@@ -1402,6 +1459,9 @@ func _start_round() -> void:
 func _physics_process(delta: float) -> void:
 	if get_tree().paused:
 		return
+
+	if rec != null and state != State.MATCH_END:
+		rec.tick(delta)
 
 	if msg_clear > 0.0:
 		msg_clear -= delta
@@ -1528,6 +1588,11 @@ func _spawn_positions() -> Array:
 
 
 func _on_player_died(p: Player) -> void:
+	if rec != null and state != State.MATCH_END:
+		var rk: int = p.killer
+		if rk >= 0 and (rk == p.index or rk >= team_ids.size() or team_ids[rk] == team_ids[p.index]):
+			rk = -1
+		rec.on_death(rk, p.index)
 	# catat kill (hanya dari peluru / pisau lawan, bukan lava / duri)
 	if p.killer >= 0 and p.killer != p.index and p.killer < kills.size() and team_ids[p.killer] != team_ids[p.index]:
 		kills[p.killer] += 1
@@ -1601,6 +1666,11 @@ func _end_round(winner: int) -> void:
 	state = State.ROUND_END
 	state_timer = 3.0
 	msg_clear = 0.0
+	if rec != null:
+		if winner >= 0:
+			rec.on_round_end(winner, _team_label(winner), _team_color(winner))
+		else:
+			rec.on_round_end(-1, "", Color.WHITE)
 	for p in players:
 		p.controls_enabled = false
 		if p.alive:
@@ -1677,6 +1747,7 @@ func _end_match(w_team: int) -> void:
 		for w in wins:
 			sc.append(str(w))
 	vs.score_text = " - ".join(sc)
+	_save_replay(true, w_team, vs.score_text)
 	vs.open_overlay.connect(_on_victory_open)
 	layer.add_child(vs)
 	victory_show = vs
@@ -2569,3 +2640,33 @@ class VictoryShow extends Control:
 		var sa: float = clampf((t - pt0 - 0.25) / 0.3, 0.0, 1.0) * (1.0 - pout)
 		if sa > 0.0:
 			VicFx.txt(ci, "MATCH WINNER   %s" % score_text, Rect2(x, plate_y + 52.0, w, 40.0), 30, Color(UIKit.GOLD, sa), HORIZONTAL_ALIGNMENT_CENTER, 7)
+
+
+# ------------------------------------------------------------------ replay
+func _setup_replay() -> void:
+	ReplayStore.ensure_loaded()
+	if not ReplayStore.enabled or Global.campaign_mode:
+		return
+	if ReplayStore.is_full_blocked():
+		UIInput.toast("REPLAY NOT RECORDED", "Replay storage is full (see REPLAY > SETTINGS)", Color("ff7a7a"))
+		return
+	rec = ReplayRecorder.new()
+	rec.begin(self)
+
+
+## Hentikan rekaman dan simpan ke file. completed = true kalau match selesai sampai ada pemenang.
+func _save_replay(completed: bool, w_team: int, score: String) -> void:
+	if rec == null or not rec.active:
+		return
+	var label: String = ""
+	var col: Color = Color.WHITE
+	if w_team >= 0:
+		label = _team_label(w_team)
+		col = _team_color(w_team)
+	var pack: Dictionary = rec.finish(completed, w_team, label, col, score)
+	rec = null
+	if pack.is_empty():
+		return
+	var id: String = ReplayStore.save_replay(pack["meta"], pack["data"])
+	if id != "" and completed:
+		UIInput.toast("REPLAY SAVED", "Watch it from REPLAY in the main menu", Color("ff6a7a"))

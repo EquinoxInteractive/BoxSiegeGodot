@@ -228,8 +228,6 @@ func _ready() -> void:
 	reset_bindings()
 	_load_settings()
 	_load_match_settings()
-	if OS.is_debug_build():
-		MapData.verify_levels()   # pastikan FEWER / NORMAL / MORE / EXTREME selalu beda jumlah objek di semua map
 	_setup_buses()
 	font_ui = load("res://assets/fonts/badaboom.ttf")
 	font_digital = load("res://assets/fonts/digital7.ttf")
@@ -255,23 +253,242 @@ func _ready() -> void:
 	Input.joy_connection_changed.connect(_on_joy_changed)
 	assign_devices()
 
-	# ANTI-LAG: siapkan suara sintetis & aset berat di latar belakang selagi pemain masih di menu
-	prewarm_synth()
+	# ANTI-LAG: pekerjaan berat (suara sintetis, preload aset, pemanasan GPU) TIDAK dijalankan di detik pertama,
+	# supaya menu bisa tampil & animasi intro berjalan mulus dulu. Setelah itu dikerjakan pelan-pelan.
+	set_process(false)
+	_start_background_prep()
+
+
+## Jeda sebelum pekerjaan latar belakang dimulai (detik). Selama jeda ini CPU/GPU dipakai penuh oleh menu.
+const PREP_DELAY := 2.5
+
+
+func _start_background_prep() -> void:
+	await get_tree().create_timer(PREP_DELAY).timeout
+	if boot_managed:
+		return                  # splash + LOADING SCREEN (scenes/loading.tscn) yang mengerjakan semua ini di depan
+	if OS.is_debug_build():
+		MapData.verify_levels()   # pastikan FEWER / NORMAL / MORE / EXTREME selalu beda jumlah objek di semua map (hanya build debug)
+	_start_asset_preload()      # dimuat satu per satu, hanya saat frame sedang lancar
+	prewarm_synth()             # thread latar belakang, dengan jeda kecil supaya tidak menghabiskan CPU
+	_prebuild_campaign()        # siapkan peta CAMPAIGN (scene, data level, ukuran huruf, atlas rantai) di latar belakang
+	_start_gpu_warmup()         # menunggu preload selesai, lalu memanaskan shader sedikit demi sedikit
+
+
+# ------------------------------------------------------------------ LOADING SCREEN (persiapan di depan)
+## Dulu semua pekerjaan berat (preload aset, suara sintetis, peta CAMPAIGN, pemanasan GPU) dikerjakan DIAM-DIAM di
+## belakang menu, dan itulah yang membuat menu / awal permainan terasa berat. Sekarang semuanya dikerjakan di
+## LOADING SCREEN (scripts/loading.gd) dengan kecepatan penuh, lengkap dengan progress bar. Begitu game masuk ke menu,
+## semuanya sudah siap -> menu, SHOP, CAMPAIGN, dan pertandingan berjalan mulus tanpa patah-patah.
+## Timer 2.5 detik di atas (_start_background_prep) hanya dipakai kalau game dibuka TANPA loading screen
+## (misalnya menjalankan scenes/menu.tscn langsung dengan F6 di editor).
+var boot_managed: bool = false          # true = loading screen yang mengatur persiapan
+var boot_fast: bool = false             # true = preload ngebut (tidak ada gameplay yang perlu dijaga mulus)
+var boot_campaign_p: float = 0.0        # 0..1 kemajuan persiapan peta CAMPAIGN
+var boot_campaign_done: bool = false
+var _pre_total: int = 0                 # jumlah aset di antrean preload saat mulai (untuk menghitung persen)
+
+
+## Dipanggil SEKALI oleh loading screen. Menyusun antrean preload, memulai thread suara & peta CAMPAIGN.
+func boot_begin() -> void:
+	boot_managed = true
+	boot_fast = true
+	boot_campaign_p = 0.0
+	boot_campaign_done = false
+	if OS.is_debug_build():
+		MapData.verify_levels()   # pastikan FEWER / NORMAL / MORE / EXTREME selalu beda jumlah objek di semua map (hanya build debug)
 	_start_asset_preload()
-	_start_gpu_warmup()
+	_pre_total = _pre_queue.size()
+	prewarm_synth()
+	_prebuild_campaign()
+
+
+## Dipanggil loading screen saat selesai: kembali ke mode hemat (tidak relevan lagi, tapi menjaga perilaku lama).
+func boot_end() -> void:
+	boot_fast = false
+
+
+## Persentase aset (sprite, sfx, scene, musik) yang sudah termuat: 0..1.
+func boot_preload_progress() -> float:
+	if not _prep_started:
+		return 0.0
+	if _pre_total <= 0:
+		return 1.0
+	var left: int = _pre_queue.size() + _pre_pending.size()
+	return clampf(1.0 - float(left) / float(_pre_total), 0.0, 1.0)
+
+
+func boot_preload_done() -> bool:
+	return background_idle()
+
+
+## Persentase suara sintetis yang sudah jadi: 0..1.
+func boot_synth_progress() -> float:
+	if _synth_state == 2:
+		return 1.0
+	return clampf(float(_synth_cache.size()) / float(maxi(SYNTH_IDS.size(), 1)), 0.0, 1.0)
+
+
+## Pemanasan shader GPU (blend additive, garis halus, poligon, partikel, teks berkontur) langsung di loading screen.
+## Berbeda dengan _start_gpu_warmup(): tidak menunggu apa pun dan tidak mengecek scene aktif.
+func boot_gpu_warm() -> void:
+	var layer := CanvasLayer.new()
+	layer.layer = 109
+	layer.process_mode = Node.PROCESS_MODE_ALWAYS
+	add_child(layer)
+	var w := GpuWarm.new()
+	w.font = font_ui
+	layer.add_child(w)
+	await w.done
+	await get_tree().process_frame
+	layer.queue_free()
+
+
+# ------------------------------------------------------------------ PERSIAPAN PETA CAMPAIGN (anti-lag)
+## Hal-hal yang dulu baru dikerjakan saat peta CAMPAIGN dibuka pertama kali (semuanya di thread utama -> lag):
+##  1) scene + script campaign_hub.gd (3500+ baris) di-compile        -> sekarang dimuat di latar belakang (antrean preload)
+##  2) data 250 level dibangun                                       -> CampaignData.levels() dipanggil lebih awal
+##  3) ukuran huruf 250 nama level diukur                            -> dihitung bertahap (beberapa per frame), disimpan di hub_name_fs
+##  4) atlas mata rantai di-bake + 81 ribu piksel diproses di GDScript -> dibake sekali; pemrosesan piksel di thread terpisah
+const HUB_SCENE := "res://scenes/campaign_hub.tscn"
+const HUB_AT_W := 88
+const HUB_AT_H := 920
+const HUB_FS_PER_FRAME := 12
+var hub_name_fs: Dictionary = {}          # nomor level -> ukuran huruf nama level (dipakai WorldPager)
+var hub_atlas: CanvasTexture = null       # atlas mata rantai & jangkar (null = belum jadi / gagal)
+var _hub_atlas_busy: bool = false
+var _hub_thread: Thread = null
+
+
+func _prebuild_campaign() -> void:
+	boot_campaign_p = 0.0
+	boot_campaign_done = false
+	# tunggu scene peta selesai dimuat di latar belakang (maks. 10 detik), supaya load() script di bawah tidak memblokir
+	var waited: float = 0.0
+	while waited < 10.0 and not _pre_keep.has(HUB_SCENE):
+		if boot_fast:
+			await get_tree().process_frame     # loading screen: cek tiap frame
+			waited += 0.016
+		else:
+			await get_tree().create_timer(0.2).timeout
+			waited += 0.2
+	boot_campaign_p = 0.15
+	CampaignData.levels()
+	boot_campaign_p = 0.30
+	await get_tree().process_frame
+	await get_hub_atlas()
+	boot_campaign_p = 0.70
+	# ukuran huruf nama level, sedikit per frame (saat loading screen: lebih banyak per frame)
+	var n: int = 1
+	while n <= CampaignData.TOTAL_LEVELS:
+		var per: int = HUB_FS_PER_FRAME * (6 if boot_fast else 1)
+		var k: int = 0
+		while k < per and n <= CampaignData.TOTAL_LEVELS:
+			if not hub_name_fs.has(n):
+				var f: int = 16
+				var nm: String = String(CampaignData.level(n)["name"])
+				while f > 10 and UIKit.text_w(nm, f) > 168.0:
+					f -= 1
+				hub_name_fs[n] = f
+			n += 1
+			k += 1
+		boot_campaign_p = 0.70 + 0.30 * float(n - 1) / float(maxi(CampaignData.TOTAL_LEVELS, 1))
+		await get_tree().process_frame
+	boot_campaign_p = 1.0
+	boot_campaign_done = true
+
+
+## Atlas mata rantai & jangkar peta CAMPAIGN. Aman dipanggil dari mana saja & kapan saja: hanya dibuat sekali,
+## pemanggil lain menunggu hasil yang sama. Mengembalikan null kalau pembuatan gagal (peta lalu memakai gambar vektor).
+func get_hub_atlas() -> CanvasTexture:
+	if hub_atlas != null:
+		return hub_atlas
+	if _hub_atlas_busy:
+		while _hub_atlas_busy:
+			await get_tree().process_frame
+		return hub_atlas
+	_hub_atlas_busy = true
+	hub_atlas = await _bake_hub_atlas()
+	_hub_atlas_busy = false
+	return hub_atlas
+
+
+func _bake_hub_atlas() -> CanvasTexture:
+	var hub_script = load("res://scripts/campaign_hub.gd")     # sengaja tanpa tipe: AtlasBake adalah kelas dalam (inner class)
+	if hub_script == null:
+		return null
+	var vp := SubViewport.new()
+	vp.size = Vector2i(HUB_AT_W, HUB_AT_H)
+	vp.transparent_bg = true
+	vp.disable_3d = true
+	vp.render_target_update_mode = SubViewport.UPDATE_ONCE
+	var bake_node: Node2D = hub_script.AtlasBake.new()
+	vp.add_child(bake_node)
+	add_child(vp)
+	await RenderingServer.frame_post_draw
+	await RenderingServer.frame_post_draw
+	var img: Image = vp.get_texture().get_image() if is_instance_valid(vp) else null
+	if is_instance_valid(vp):
+		vp.queue_free()
+	if img == null or img.is_empty() or img.get_width() != HUB_AT_W:
+		return null
+	img.convert(Image.FORMAT_RGBA8)
+	# semua sel = topeng putih (warna asli lewat modulate saat digambar). Dikerjakan di THREAD terpisah.
+	var info := {"seen": 0}
+	_hub_thread = Thread.new()
+	_hub_thread.start(_hub_atlas_whiten.bind(img, info), Thread.PRIORITY_LOW)
+	while _hub_thread.is_alive():
+		await get_tree().process_frame
+	_hub_thread.wait_to_finish()
+	_hub_thread = null
+	if int(info["seen"]) < 128:
+		return null
+	img.generate_mipmaps()
+	var ct := CanvasTexture.new()
+	ct.diffuse_texture = ImageTexture.create_from_image(img)
+	ct.texture_filter = CanvasItem.TEXTURE_FILTER_LINEAR_WITH_MIPMAPS
+	return ct
+
+
+## Berjalan di thread terpisah (hanya menyentuh objek Image & Dictionary milik sendiri).
+func _hub_atlas_whiten(img: Image, info: Dictionary) -> void:
+	var d: PackedByteArray = img.get_data()
+	var n: int = d.size()
+	var seen: int = 0
+	var i: int = 0
+	while i + 3 < n:
+		var a: int = d[i + 3]
+		if a > seen:
+			seen = a
+		d[i] = 255
+		d[i + 1] = 255
+		d[i + 2] = 255
+		i += 4
+		if (i & 0x7FFF) == 0:
+			OS.delay_msec(1)       # beri napas ke thread utama
+	img.set_data(img.get_width(), img.get_height(), false, Image.FORMAT_RGBA8, d)
+	info["seen"] = seen
 
 
 func _exit_tree() -> void:
 	_synth_abort = true
 	if _synth_thread != null and _synth_thread.is_started():
 		_synth_thread.wait_to_finish()
+	if _hub_thread != null and _hub_thread.is_started():
+		_hub_thread.wait_to_finish()
 
 
 # ------------------------------------------------------------------ PRELOAD ASET (anti-lag)
 ## Tekstur / suara / musik dimuat di latar belakang sejak game dibuka, lalu DIPEGANG di memori.
 ## Sebelumnya aset baru dibaca dari disk saat pertama dipakai (mis. saat match mulai / peluru pertama), dan
 ## bisa terhapus lagi dari cache begitu tidak ada yang memakainya -> baca disk ulang -> patah-patah.
-const PRELOAD_PER_FRAME := 3                 # maksimal aset yang diambil per frame (supaya tidak ada lonjakan)
+const PRELOAD_SCENES := ["campaign", "select", "game", "battle", "team"]   # scene yang di-compile lebih awal (selain peta CAMPAIGN)
+const PRELOAD_PER_FRAME := 2                 # maksimal aset yang diambil per frame (supaya tidak ada lonjakan)
+const PRELOAD_IN_FLIGHT := 3                 # maksimal permintaan muat yang berjalan bersamaan (dulu: SEMUA sekaligus)
+const PRELOAD_MAX_FRAME := 0.030             # kalau satu frame lebih lama dari ini (detik), permintaan baru ditahan dulu
+const PRELOAD_MAX_SKIP := 8                  # batas penahanan berturut-turut supaya preload tetap selesai di PC lemah
+var _pre_queue: Array[String] = []           # path yang belum diminta (diminta bertahap oleh _process)
+var _pre_skipped: int = 0
 const _PRE_TEX_DIRS := ["res://assets/sprites/characters/p1", "res://assets/sprites/characters/p2",
 		"res://assets/sprites/characters/p3", "res://assets/sprites/characters/p4",
 		"res://assets/sprites/guns", "res://assets/sprites/guns/p1", "res://assets/sprites/guns/p2",
@@ -283,16 +500,11 @@ var _pre_keep := {}                          # path -> resource yang dipegang te
 
 
 func _start_asset_preload() -> void:
-	# 1) musik
-	for m in ["menu", "game", "campaign", "boss"]:
-		_pre_request("res://assets/music/music_%s.ogg" % m)
-	# 2) sprite
-	for d in _PRE_TEX_DIRS:
-		for f in _list_res_files(String(d)):
-			var ext: String = f.get_extension().to_lower()
-			if ext == "png" or ext == "jpg" or ext == "webp":
-				_pre_request("%s/%s" % [d, f])
-	# 3) sfx (urutan ekstensi sama seperti get_sfx: mp3, wav, ogg)
+	# Hanya MENYUSUN antrean di sini. Permintaan muat dikirim sedikit demi sedikit di _process().
+	# Urutan: scene peta CAMPAIGN -> sfx kecil -> sprite -> scene lain -> musik besar.
+	# (Memuat scene di latar belakang juga meng-compile script-nya, jadi tidak ada jeda saat scene dibuka pertama kali.)
+	_pre_queue.append(HUB_SCENE)
+	# 1) sfx (urutan ekstensi sama seperti get_sfx: mp3, wav, ogg)
 	var found := {}   # nama -> {ext: true}
 	for f in _list_res_files("res://assets/sfx"):
 		var ext2: String = f.get_extension().to_lower()
@@ -300,15 +512,30 @@ func _start_asset_preload() -> void:
 			var nm: String = f.get_basename()
 			if not found.has(nm):
 				found[nm] = {}
-			found[nm][ext2] = true
+			found[nm][ext2] = f   # simpan nama file ASLI (ada yang berekstensi huruf besar, mis. round_10.WAV)
 	for nm2 in found:
 		for ext3 in ["mp3", "wav", "ogg"]:
 			if found[nm2].has(ext3):
-				var path: String = "res://assets/sfx/%s.%s" % [nm2, ext3]
+				var path: String = "res://assets/sfx/%s" % String(found[nm2][ext3])
 				_pre_sfx_of[path] = String(nm2)
-				_pre_request(path)
+				_pre_queue.append(path)
 				break
-	set_process(not _pre_pending.is_empty())
+	# 2) sprite
+	for d in _PRE_TEX_DIRS:
+		for f in _list_res_files(String(d)):
+			var ext: String = f.get_extension().to_lower()
+			if ext == "png" or ext == "jpg" or ext == "webp":
+				_pre_queue.append("%s/%s" % [d, f])
+	# 3) scene lain beserta script-nya (compile di thread latar belakang)
+	if boot_managed:
+		_pre_queue.append("res://scenes/menu.tscn")   # menu sudah ter-compile sebelum loading screen selesai
+	for sc in PRELOAD_SCENES:
+		_pre_queue.append("res://scenes/%s.tscn" % sc)
+	# 4) musik (paling akhir karena paling besar)
+	for m in ["game", "campaign", "boss", "menu"]:
+		_pre_queue.append("res://assets/music/music_%s.ogg" % m)
+	_prep_started = true
+	set_process(not _pre_queue.is_empty())
 
 
 ## Daftar file di folder res:// (juga benar di game hasil export: akhiran .import / .remap dibuang).
@@ -333,6 +560,19 @@ func _pre_request(path: String) -> void:
 		_pre_pending.append(path)
 
 
+func _preload_busy() -> bool:
+	return not _pre_queue.is_empty() or not _pre_pending.is_empty()
+
+
+var _prep_started: bool = false
+
+
+## True kalau preload aset Global sudah dimulai DAN selesai. Pemanasan lain (Shop/Inventory di menu) menunggu ini
+## supaya semua pekerjaan latar belakang berjalan BERURUTAN, bukan bersamaan.
+func background_idle() -> bool:
+	return _prep_started and not _preload_busy()
+
+
 ## Simpan resource yang sudah termuat ke cache yang dipakai game.
 func _pre_adopt(path: String, res: Resource) -> void:
 	if res == null:
@@ -348,10 +588,14 @@ func _pre_adopt(path: String, res: Resource) -> void:
 		_pre_keep[path] = res
 
 
-func _process(_delta: float) -> void:
+func _process(delta: float) -> void:
+	# saat LOADING SCREEN tampil: ambil & minta lebih banyak aset per frame (tidak ada gameplay yang perlu dijaga mulus)
+	var per_frame: int = PRELOAD_PER_FRAME * (4 if boot_fast else 1)
+	var in_flight: int = PRELOAD_IN_FLIGHT * (4 if boot_fast else 1)
+	# 1) ambil aset yang sudah selesai dimuat
 	var taken: int = 0
 	var i: int = 0
-	while i < _pre_pending.size() and taken < PRELOAD_PER_FRAME:
+	while i < _pre_pending.size() and taken < per_frame:
 		var path: String = _pre_pending[i]
 		var status: int = ResourceLoader.load_threaded_get_status(path)
 		if status == ResourceLoader.THREAD_LOAD_LOADED:
@@ -362,7 +606,19 @@ func _process(_delta: float) -> void:
 			i += 1
 		else:
 			_pre_pending.remove_at(i)   # gagal / tidak valid -> dilewati (nanti dimuat biasa saat dibutuhkan)
-	if _pre_pending.is_empty():
+	# 2) minta aset berikutnya: satu per frame, maksimal PRELOAD_IN_FLIGHT sekaligus, dan hanya kalau frame sedang lancar
+	if boot_fast:
+		var req: int = 0
+		while req < 4 and not _pre_queue.is_empty() and _pre_pending.size() < in_flight:
+			_pre_request(String(_pre_queue.pop_front()))
+			req += 1
+	elif not _pre_queue.is_empty() and _pre_pending.size() < in_flight:
+		if delta <= PRELOAD_MAX_FRAME or _pre_skipped >= PRELOAD_MAX_SKIP:
+			_pre_skipped = 0
+			_pre_request(String(_pre_queue.pop_front()))
+		else:
+			_pre_skipped += 1
+	if not _preload_busy():
 		set_process(false)
 
 
@@ -372,7 +628,16 @@ func _process(_delta: float) -> void:
 ## Di sini semua jenis gambar itu digambar sekali di menu (nyaris transparan, ukuran ~1 piksel, +-0.5 detik),
 ## jadi kompilasinya selesai sebelum pertandingan. Tampilan game tidak berubah.
 func _start_gpu_warmup() -> void:
-	await get_tree().create_timer(1.2).timeout
+	# Tunggu preload & pemanasan Shop/Inventory selesai dulu (maks. 25 detik) supaya kompilasi shader tidak menumpuk dengan pemuatan aset.
+	var waited: float = 0.0
+	while waited < 25.0 and (_preload_busy() or CosmeticUI.menu_warm_pending()):
+		await get_tree().create_timer(0.25).timeout
+		waited += 0.25
+	await get_tree().create_timer(0.3).timeout
+	# Kalau pemain sudah keluar dari menu (masuk pertandingan), jangan memanaskan di tengah permainan.
+	var cs: Node = get_tree().current_scene
+	if cs == null or not String(cs.scene_file_path).ends_with("menu.tscn"):
+		return
 	var layer := CanvasLayer.new()
 	layer.layer = 109
 	layer.process_mode = Node.PROCESS_MODE_ALWAYS
@@ -380,14 +645,20 @@ func _start_gpu_warmup() -> void:
 	var w := GpuWarm.new()
 	w.font = font_ui
 	layer.add_child(w)
-	await get_tree().create_timer(0.6).timeout
+	await w.done
+	await get_tree().process_frame
 	layer.queue_free()
 
 
+## Menggambar tiap jenis gambar SATU PER FRAME (bukan semuanya dalam satu frame), jadi kompilasi shader
+## tersebar dan tidak menimbulkan satu lonjakan besar.
 class GpuWarm extends Node2D:
+	signal done
 	var font: Font = null
 	var additive: bool = false
+	var step: int = 0
 	var _tex: GradientTexture2D = null
+	var _add_mat: CanvasItemMaterial = null
 
 	func _ready() -> void:
 		modulate = Color(1, 1, 1, 0.02)     # tetap digambar (shader dikompilasi) tapi tak terlihat
@@ -403,68 +674,95 @@ class GpuWarm extends Node2D:
 		_tex.fill = GradientTexture2D.FILL_RADIAL
 		_tex.fill_from = Vector2(0.5, 0.5)
 		_tex.fill_to = Vector2(1.0, 0.5)
-		var add_mat := CanvasItemMaterial.new()
-		add_mat.blend_mode = CanvasItemMaterial.BLEND_MODE_ADD
+		_add_mat = CanvasItemMaterial.new()
+		_add_mat.blend_mode = CanvasItemMaterial.BLEND_MODE_ADD
 		if additive:
-			material = add_mat
+			material = _add_mat
 		else:
 			var kid := GpuWarm.new()
 			kid.additive = true
 			kid.font = font
 			add_child(kid)
-			# partikel: gaya konfeti (tanpa tekstur) dan gaya percikan cahaya (tekstur + additive)
-			var cr := Gradient.new()
-			cr.set_color(0, Color("ffd23f"))
-			cr.set_color(1, Color.WHITE)
-			var conf := CPUParticles2D.new()
-			conf.amount = 6
-			conf.lifetime = 0.4
-			conf.one_shot = true
-			conf.explosiveness = 1.0
-			conf.spread = 180.0
-			conf.initial_velocity_min = 20.0
-			conf.initial_velocity_max = 60.0
-			conf.angular_velocity_min = -200.0
-			conf.angular_velocity_max = 200.0
-			conf.scale_amount_min = 5.0
-			conf.scale_amount_max = 9.0
-			conf.color_initial_ramp = cr
-			add_child(conf)
-			conf.emitting = true
-			var glo := CPUParticles2D.new()
-			glo.amount = 6
-			glo.lifetime = 0.4
-			glo.one_shot = true
-			glo.explosiveness = 1.0
-			glo.spread = 180.0
-			glo.initial_velocity_min = 20.0
-			glo.initial_velocity_max = 60.0
-			glo.scale_amount_min = 5.0
-			glo.scale_amount_max = 9.0
-			glo.texture = _tex
-			glo.material = add_mat
-			glo.color_ramp = cr
-			add_child(glo)
-			glo.emitting = true
 		queue_redraw()
 
+	## Partikel: gaya konfeti (tanpa tekstur) dan gaya percikan cahaya (tekstur + additive).
+	func _spawn_confetti() -> void:
+		var cr := Gradient.new()
+		cr.set_color(0, Color("ffd23f"))
+		cr.set_color(1, Color.WHITE)
+		var conf := CPUParticles2D.new()
+		conf.amount = 6
+		conf.lifetime = 0.4
+		conf.one_shot = true
+		conf.explosiveness = 1.0
+		conf.spread = 180.0
+		conf.initial_velocity_min = 20.0
+		conf.initial_velocity_max = 60.0
+		conf.angular_velocity_min = -200.0
+		conf.angular_velocity_max = 200.0
+		conf.scale_amount_min = 5.0
+		conf.scale_amount_max = 9.0
+		conf.color_initial_ramp = cr
+		add_child(conf)
+		conf.emitting = true
+
+	func _spawn_glow() -> void:
+		var cr := Gradient.new()
+		cr.set_color(0, Color("ffd23f"))
+		cr.set_color(1, Color.WHITE)
+		var glo := CPUParticles2D.new()
+		glo.amount = 6
+		glo.lifetime = 0.4
+		glo.one_shot = true
+		glo.explosiveness = 1.0
+		glo.spread = 180.0
+		glo.initial_velocity_min = 20.0
+		glo.initial_velocity_max = 60.0
+		glo.scale_amount_min = 5.0
+		glo.scale_amount_max = 9.0
+		glo.texture = _tex
+		glo.material = _add_mat
+		glo.color_ramp = cr
+		add_child(glo)
+		glo.emitting = true
+
 	func _process(_d: float) -> void:
-		queue_redraw()    # beberapa frame berturut-turut supaya semua varian benar-benar terpakai
+		step += 1
+		if not additive:
+			if step == 7:
+				_spawn_confetti()
+			elif step == 9:
+				_spawn_glow()
+			elif step == 14:
+				set_process(false)
+				done.emit()
+				return
+		elif step > 14:
+			set_process(false)
+			return
+		queue_redraw()
 
 	func _draw() -> void:
 		var tri := PackedVector2Array([Vector2(0, 0), Vector2(40, 8), Vector2(12, 40)])
-		draw_rect(Rect2(0, 0, 40, 40), Color.WHITE)
-		draw_texture_rect(_tex, Rect2(0, 0, 40, 40), false, Color.WHITE)
-		draw_line(Vector2(0, 0), Vector2(40, 40), Color.WHITE, 3.0, true)
-		draw_line(Vector2(0, 40), Vector2(40, 0), Color.WHITE, 1.0, false)
-		draw_polyline(tri, Color.WHITE, 3.0, true)
-		draw_colored_polygon(tri, Color.WHITE)
-		draw_polygon(tri, PackedColorArray([Color.WHITE, Color(1, 1, 1, 0.0), Color(1, 1, 1, 0.0)]))
-		draw_arc(Vector2(20, 20), 18.0, 0.0, TAU, 32, Color.WHITE, 3.0, true)
-		draw_circle(Vector2(20, 20), 10.0, Color.WHITE)
-		if font != null:
-			draw_string(font, Vector2(0, 30), "A1", HORIZONTAL_ALIGNMENT_LEFT, -1, 16, Color.WHITE)
-			draw_string_outline(font, Vector2(0, 30), "A1", HORIZONTAL_ALIGNMENT_LEFT, -1, 16, 4, Color.BLACK)
+		match step:
+			0, 1:
+				draw_rect(Rect2(0, 0, 40, 40), Color.WHITE)
+				draw_texture_rect(_tex, Rect2(0, 0, 40, 40), false, Color.WHITE)
+			2:
+				draw_line(Vector2(0, 0), Vector2(40, 40), Color.WHITE, 3.0, true)
+				draw_line(Vector2(0, 40), Vector2(40, 0), Color.WHITE, 1.0, false)
+			3:
+				draw_polyline(tri, Color.WHITE, 3.0, true)
+			4:
+				draw_colored_polygon(tri, Color.WHITE)
+				draw_polygon(tri, PackedColorArray([Color.WHITE, Color(1, 1, 1, 0.0), Color(1, 1, 1, 0.0)]))
+			5:
+				draw_arc(Vector2(20, 20), 18.0, 0.0, TAU, 32, Color.WHITE, 3.0, true)
+				draw_circle(Vector2(20, 20), 10.0, Color.WHITE)
+			6:
+				if font != null:
+					draw_string(font, Vector2(0, 30), "A1", HORIZONTAL_ALIGNMENT_LEFT, -1, 16, Color.WHITE)
+					draw_string_outline(font, Vector2(0, 30), "A1", HORIZONTAL_ALIGNMENT_LEFT, -1, 16, 4, Color.BLACK)
 
 
 # ------------------------------------------------------------------ data helpers
@@ -1258,6 +1556,7 @@ func _make_slash_stream() -> AudioStreamWAV:
 const SYNTH_IDS := ["clear_boom", "coin", "whistle", "pop", "applause", "vic_riser", "vic_crash", "chime",
 		"stab", "shimmer", "clear_fanfare", "vic_anthem"]   # urutan = dari yang ringan ke yang berat; vic_*: animasi kemenangan VERSUS (game.gd)
 const SYNTH_CHUNK := 2600           # sampel per potongan kerja (dipakai thread latar belakang)
+const SYNTH_YIELD_MS := 3           # jeda (ms) tiap potongan: thread tidak memakan 100% satu core -> game tidak patah-patah
 const SYNTH_CACHE_VER := 1          # NAIK-kan angka ini kalau Anda mengubah rumus suara _syn_* (supaya cache disk dibuat ulang)
 const SYNTH_CACHE_DIR := "user://synth_cache"
 const _FT_SAW := 0
@@ -1412,6 +1711,7 @@ func _synth_build_sync(id: String) -> AudioStreamWAV:
 		var e: int = mini(i + SYNTH_CHUNK, n)
 		_synth_fill(id, buf, i, e, rate, ctx)
 		i = e
+		OS.delay_msec(1 if boot_fast else SYNTH_YIELD_MS)   # beri napas ke thread utama / audio (saat loading screen: lebih ngebut)
 	# normalisasi + ubah ke 16-bit
 	var peak: float = 0.0001
 	for k in n:

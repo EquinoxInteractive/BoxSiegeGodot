@@ -3,6 +3,8 @@ extends Control
 ##   MAIN -> PLAY / CONTROLS / SETTINGS / QUIT
 ##   PLAYERS (pilih 2/3/4 pemain), SETTINGS (musik, sfx, getar, shake, fullscreen, show fps, limit fps, CONTROLS SETUP),
 ##   CONTROLS (daftar tombol yang sedang dipakai)
+##   ABOUT US (tombol di pojok kiri atas menu utama): info studio, tim developer, info teknis, kontak, legal.
+##     Isi / teks / logo ada di about_data.gd, tampilan di about_ui.gd.
 ##   SETTINGS > CONTROLS SETUP ("binds"): pilih Controller / Keyboard tiap pemain + ganti keybind.
 ## Pengaturan bersifat DRAF: perubahan langsung terlihat/terdengar (termasuk indikator P1-P4 di kanan atas),
 ## tetapi baru disimpan ke file setelah tombol SAVE. Keluar tanpa SAVE (BACK dua kali) = perubahan dibuang.
@@ -30,6 +32,9 @@ var rng := RandomNumberGenerator.new()
 
 var controls_pads_label: Label
 var binds: BindsEditor
+var about: AboutUI.AboutPanel
+
+const ABOUT_DOCK := 3        # indeks tombol ABOUT US di daftar dock (0 SHOP, 1 INVENTORY, 2 REPLAY, 3 ABOUT US)
 
 const SET_SETUP := 7      # indeks item di layar settings: 0-6 baris setting, 7 CONTROLS SETUP, 8 SAVE, 9 BACK
 const SET_SAVE := 8
@@ -43,6 +48,7 @@ var _discard_until: int = 0
 
 
 func _ready() -> void:
+	AboutUI.preload_assets()      # muat logo + font About di thread lain, supaya membuka About tidak patah
 	rng.randomize()
 	theme = Global.ui_theme
 	Global.play_music("menu")
@@ -62,6 +68,7 @@ func _ready() -> void:
 	_build_settings()
 	_build_binds()
 	_build_controls()
+	_build_about()
 
 	status = UIKit.PadStatus.new()
 	status.position = Vector2(1280 - 350 - 24, 16)
@@ -74,6 +81,7 @@ func _ready() -> void:
 
 	_show_screen("main", true)
 	_play_intro()
+	_warm_about()
 
 
 func _exit_tree() -> void:
@@ -266,6 +274,20 @@ func _build_main() -> void:
 		dock.append(d)
 		d.hovered.connect(_dock_hover.bind(k))
 		d.activated.connect(_dock_open.bind(k))
+	# ---- REPLAY: tombol sendiri di kanan atas (di bawah indikator P1-P4), terpisah dari daftar menu dan dari SHOP / INVENTORY
+	var rb := ReplayUI.DockButton.new()
+	rb.position = Vector2(994.0, 70.0)
+	s.add_child(rb)
+	dock.append(rb)
+	rb.hovered.connect(_dock_hover.bind(2))
+	rb.activated.connect(_dock_open.bind(2))
+	# ---- ABOUT US: tombol info developer di pojok kiri atas (di atas logo), terpisah dari daftar menu
+	var ab := AboutUI.AboutButton.new()
+	ab.position = Vector2(40.0, 26.0)
+	s.add_child(ab)
+	dock.append(ab)          # indeks = ABOUT_DOCK
+	ab.hovered.connect(_dock_hover.bind(ABOUT_DOCK))
+	ab.activated.connect(_dock_open.bind(ABOUT_DOCK))
 
 
 func _build_players() -> void:
@@ -455,6 +477,48 @@ func _build_controls() -> void:
 	sheet.position = Vector2(60, 184)
 	s.add_child(sheet)
 	s.set_meta("sheet", sheet)
+
+
+## Layar ABOUT US (isi di about_data.gd, komponen di about_ui.gd).
+func _build_about() -> void:
+	var s := _make_screen("about")
+	var banner := UIKit.Banner.new(AboutData.SCREEN_TITLE, 52)
+	banner.position = Vector2(290, 104)
+	s.add_child(banner)
+	about = AboutUI.AboutPanel.new()
+	about.position = Vector2(60, 184)
+	s.add_child(about)
+	about.back_requested.connect(_go_back)
+	about.page_changed.connect(_update_prompts)
+	# tombol BACK untuk pengguna mouse (keyboard / controller: tombol BACK biasa)
+	var back := UIKit.FancyButton.new("BACK", Vector2(250, 52), 30)
+	back.auto_hover = true
+	back.position = Vector2(970, 112)
+	s.add_child(back)
+	back.activated.connect(_go_back)
+
+
+## Pemanasan layar ABOUT US (tanpa lonjakan frame):
+##  1) GlyphWarmer menggambar semua teks About di luar layar, sedikit demi sedikit (maks ~2.5 ms per frame), sehingga
+##     font / glyph sudah masuk atlas sebelum About dibuka.
+##  2) about.prime() mengisi cache ukuran teks, satu halaman per frame.
+## Sebelumnya seluruh layar About dirender sekaligus 1.6 detik setelah game dibuka -> itulah penyebab frame drop di awal.
+func _warm_about() -> void:
+	await get_tree().process_frame
+	if not is_inside_tree() or leaving:
+		return
+	var gw := AboutUI.GlyphWarmer.new()
+	add_child(gw)
+	await gw.finished
+	if not is_inside_tree() or leaving:
+		return
+	await about.prime()
+
+
+func _open_about() -> void:
+	about.reset()
+	Global.play_sfx("ui_panel", -5.0)
+	_show_screen("about")
 
 
 # ------------------------------------------------------------------ editor CONTROLS SETUP
@@ -1073,7 +1137,7 @@ func _show_screen(name_id: String, instant: bool = false) -> void:
 func _update_prompts() -> void:
 	match current:
 		"main":
-			prompt.set_prompts([[&"dpad_ud", "NAVIGATE"], [&"accept", "SELECT"]])
+			prompt.set_prompts([[&"dpad_ud", "NAVIGATE"], [&"accept", "SELECT"], [&"extra", "REPLAY"]])
 		"players":
 			prompt.set_prompts([[&"dpad_lr", "CHOOSE"], [&"accept", "CONFIRM"], [&"back", "BACK"]])
 		"settings":
@@ -1085,6 +1149,11 @@ func _update_prompts() -> void:
 				prompt.set_prompts([[&"dpad_ud", "NAVIGATE"], [&"dpad_lr", "CHANGE"], [&"accept", "REBIND"], [&"extra", "DEFAULT"], [&"back", "BACK"]])
 		"controls":
 			prompt.set_prompts([[&"back", "BACK"]])
+		"about":
+			if about != null and (about.page == 1 or about.page == 2):
+				prompt.set_prompts([[&"dpad_lr", "PAGE"], [&"dpad_ud", "SELECT"], [&"accept", "OPEN LINK"], [&"back", "BACK"]])
+			else:
+				prompt.set_prompts([[&"dpad_lr", "PAGE"], [&"back", "BACK"]])
 
 
 func _select(name_id: String, i: int, sound: bool = true) -> void:
@@ -1111,7 +1180,7 @@ func _hover(name_id: String, i: int) -> void:
 func _dock_set(i: int, sound: bool = true) -> void:
 	dock_idx = i
 	for k in dock.size():
-		(dock[k] as CosmeticUI.DockButton).set_selected(k == i)
+		dock[k].set_selected(k == i)
 	var list: Array = items["main"]
 	for k in list.size():
 		list[k].set_selected(i < 0 and k == int(idx["main"]))
@@ -1127,12 +1196,36 @@ func _dock_hover(k: int) -> void:
 func _dock_open(k: int) -> void:
 	if leaving or current != "main":
 		return
+	if k == ABOUT_DOCK:
+		_open_about()          # ABOUT US membuka layar di menu ini (bukan pindah scene)
+		return
 	leaving = true
-	Global.goto("shop" if k == 0 else "inventory")
+	Global.goto("shop" if k == 0 else ("inventory" if k == 1 else "replay"))
 
 
 ## Mengembalikan true kalau input sudah dipakai oleh dock.
 func _dock_input(action: StringName) -> bool:
+	# ABOUT US (kiri atas): BAWAH = item pertama daftar menu, ATAS = item terakhir (menyambung seperti putaran daftar)
+	if dock_idx == ABOUT_DOCK:
+		match action:
+			&"down":
+				_dock_set(-1, false)
+				_select("main", 0)
+				return true
+			&"up":
+				_dock_set(-1, false)
+				_select("main", items["main"].size() - 1)
+				return true
+			&"left", &"right":
+				return true
+			&"accept":
+				dock[dock_idx].press()
+				return true
+		return false
+	# ATAS dari item pertama daftar menu -> tombol ABOUT US
+	if dock_idx < 0 and action == &"up" and int(idx["main"]) == 0:
+		_dock_set(ABOUT_DOCK)
+		return true
 	match action:
 		&"right":
 			if dock_idx < 0:
@@ -1144,16 +1237,25 @@ func _dock_input(action: StringName) -> bool:
 			if dock_idx == 1:
 				_dock_set(0)
 				return true
-			if dock_idx == 0:
+			if dock_idx == 0 or dock_idx == 2:
 				_dock_set(-1)
 				return true
-		&"up", &"down":
+		&"up":
+			if dock_idx == 0 or dock_idx == 1:
+				_dock_set(2)       # SHOP / INVENTORY -> REPLAY (di atasnya)
+				return true
+			if dock_idx == 2:
+				return true
+		&"down":
+			if dock_idx == 2:
+				_dock_set(0)
+				return true
 			if dock_idx >= 0:
 				_dock_set(-1)
 				return true
 		&"accept":
 			if dock_idx >= 0:
-				(dock[dock_idx] as CosmeticUI.DockButton).press()
+				dock[dock_idx].press()
 				return true
 	return false
 
@@ -1202,6 +1304,11 @@ func _activate() -> void:
 func _go_back() -> void:
 	if current == "main":
 		return
+	if current == "about":
+		Global.play_sfx("ui_back", -5.0)
+		_show_screen("main")
+		_dock_set(ABOUT_DOCK, false)      # fokus kembali ke tombol ABOUT US
+		return
 	if current == "binds":
 		Global.play_sfx("ui_back", -5.0)
 		_show_screen("settings")      # CONTROLS SETUP ada di dalam SETTINGS; draf perubahan tetap dibawa
@@ -1227,6 +1334,9 @@ func _on_input(_source: int, action: StringName) -> void:
 	if current == "binds":
 		binds.handle(action)     # editor kontrol punya navigasi sendiri
 		return
+	if current == "about":
+		about.handle(action)     # panel ABOUT US punya navigasi sendiri (halaman, link, back)
+		return
 	if current == "main" and _dock_input(action):
 		return
 	match action:
@@ -1251,6 +1361,8 @@ func _on_input(_source: int, action: StringName) -> void:
 		&"extra":
 			if current == "settings":
 				_save_changes()
+			elif current == "main":
+				_dock_open(2)          # pintasan: Y / TAB = REPLAY
 		&"back":
 			_go_back()
 		&"start":

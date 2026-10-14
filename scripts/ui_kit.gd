@@ -438,6 +438,11 @@ class PromptBar extends HBoxContainer:
 
 
 # ================================================================== FxBackground
+## Shader latar dibuat SEKALI lalu dipakai semua FxBackground (menu, shop, inventory, dst).
+## Dulu tiap layar membuat Shader baru -> dikompilasi ulang di GPU saat layar dibuka (patah di awal).
+static var _bg_shader: Shader = null
+
+
 class FxBackground extends Control:
 	var rect: ColorRect
 	var mat: ShaderMaterial
@@ -458,10 +463,11 @@ class FxBackground extends Control:
 		img_a.modulate.a = 0.0
 		img_b.modulate.a = 0.0
 
-		var sh := Shader.new()
-		sh.code = UIKit.BG_SHADER
+		if UIKit._bg_shader == null:
+			UIKit._bg_shader = Shader.new()
+			UIKit._bg_shader.code = UIKit.BG_SHADER
 		mat = ShaderMaterial.new()
-		mat.shader = sh
+		mat.shader = UIKit._bg_shader
 		rect = ColorRect.new()
 		rect.set_anchors_preset(Control.PRESET_FULL_RECT)
 		rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -570,6 +576,11 @@ class FancyButton extends Control:
 	var accent: Color = UIKit.GOLD
 	var disabled: bool = false
 	var selected: bool = false
+	## true = tombol menyorot sendiri saat kursor mouse di atasnya (geser + warna aksen + kilau + kursor tangan).
+	## Dipakai tombol mandiri seperti BACK. Tombol menu yang sudah diatur layarnya (hover -> pilih) tidak perlu.
+	var auto_hover: bool = false
+	## Transparansi saat tombol tidak disorot (hover / fokus keyboard-controller membuatnya penuh 1.0).
+	var idle_alpha: float = 1.0
 	var sel: float = 0.0:
 		set(v):
 			sel = v
@@ -579,6 +590,7 @@ class FancyButton extends Control:
 			flash = v
 			queue_redraw()
 	var _tw: Tween
+	var _hov: bool = false
 
 	func _init(t: String = "", sz: Vector2 = Vector2(460, 74), fsize: int = 40) -> void:
 		text = t
@@ -590,24 +602,55 @@ class FancyButton extends Control:
 		pivot_offset = sz * 0.5
 
 	func _ready() -> void:
-		mouse_entered.connect(func() -> void: hovered.emit())
+		if auto_hover:
+			mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
+		mouse_entered.connect(_on_mouse_entered)
+		mouse_exited.connect(_on_mouse_exited)
+		if idle_alpha < 1.0 and not selected:
+			modulate.a = idle_alpha
+
+	func _on_mouse_entered() -> void:
+		hovered.emit()
+		if auto_hover and not _hov:
+			_hov = true
+			if not disabled:
+				Global.play_sfx("ui_hover", -9.0)
+			_sync_sel()
+
+	func _on_mouse_exited() -> void:
+		if auto_hover and _hov:
+			_hov = false
+			_sync_sel()
 
 	func _gui_input(event: InputEvent) -> void:
 		if event is InputEventMouseButton and event.pressed and event.button_index == MOUSE_BUTTON_LEFT:
 			press()
 
+	## Tombol sedang tampil menyala? (fokus keyboard / controller ATAU kursor mouse di atasnya)
+	func is_lit() -> bool:
+		return selected or (auto_hover and _hov and not disabled)
+
 	func set_selected(v: bool) -> void:
 		if v == selected:
 			return
 		selected = v
-		set_process(v)
+		_sync_sel()
+
+	func _sync_sel() -> void:
+		var on: bool = is_lit()
+		set_process(on)
 		if _tw:
 			_tw.kill()
 		if is_inside_tree():
 			_tw = UIKit.tw(self)
-			_tw.tween_property(self, "sel", 1.0 if v else 0.0, 0.22).set_trans(Tween.TRANS_QUART).set_ease(Tween.EASE_OUT)
+			_tw.set_parallel(true)
+			_tw.tween_property(self, "sel", 1.0 if on else 0.0, 0.22).set_trans(Tween.TRANS_QUART).set_ease(Tween.EASE_OUT)
+			if idle_alpha < 1.0:
+				_tw.tween_property(self, "modulate:a", 1.0 if on else idle_alpha, 0.18)
 		else:
-			sel = 1.0 if v else 0.0
+			sel = 1.0 if on else 0.0
+			if idle_alpha < 1.0:
+				modulate.a = 1.0 if on else idle_alpha
 
 	func press() -> void:
 		if disabled:
@@ -646,7 +689,7 @@ class FancyButton extends Control:
 			draw_colored_polygon(UIKit.slanted(8, bh, skew * 0.0 + 2.0, shift + 3.0, 0), Color(accent, 0.5 * (1.0 - sel)))
 		draw_polyline(UIKit.closed(pts), Color(1, 1, 1, lerpf(0.16, 0.95, sel)), 2.0 + sel * 1.5, true)
 		# kilau berjalan
-		if selected:
+		if is_lit():
 			var ph: float = fmod(Time.get_ticks_msec() / 1000.0 * 0.7, 1.7) - 0.35
 			var sx: float = shift + ph * bw
 			var band := PackedVector2Array([

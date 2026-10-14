@@ -6,7 +6,7 @@ extends RefCounted
 ## Konsep:
 ##   - Skin karakter  : tema yang sama (CosmeticsData.CHAR_SKINS) tersedia untuk tiap karakter, dibeli PER karakter.
 ##   - Skin senjata   : 5 per senjata (smith, kurval, flamer, scream, pistol, knife).
-##   - Aksesoris      : 4 slot (head/face/neck/back), dibeli sekali, dipasang bebas PER (karakter + skin).
+##   - Aksesoris      : 4 slot (head/face/neck/back), dibeli sekali, dipasang bebas PER (pemain P1-P4 + karakter + skin).
 ##   - Koin           : didapat dari menyelesaikan level CAMPAIGN (lihat award_level()).
 
 const SAVE_PATH := "user://cosmetics.cfg"
@@ -24,6 +24,13 @@ const FACE_BOX := 180.0
 static var _profile: Dictionary = {}
 static var _loaded: bool = false
 static var _tex_cache: Dictionary = {}
+## --- cache performa (hanya menyimpan hasil hitung, tidak mengubah data/save) ---
+static var _prefetched: Dictionary = {}        # path -> true (sudah diminta dimuat di thread latar)
+static var _acc_idx: Dictionary = {}           # acc_id -> baris data aksesoris
+static var _lo_cache: Dictionary = {}          # kunci loadout -> Dictionary (HANYA untuk UI, baca-saja)
+static var _acc_tex_cache: Dictionary = {}     # acc_id -> Texture2D
+static var _cskin_tex_cache: Dictionary = {}   # skin_id -> {char: Texture2D}
+static var _wskin_tex_cache: Dictionary = {}   # weapon -> {skin_id: Texture2D}
 
 
 # ------------------------------------------------------------------ save / load
@@ -33,7 +40,7 @@ static func _blank() -> Dictionary:
 		"skins": {},        # "char:skin_id" -> true
 		"wskins": {},       # "weapon:skin_id" -> true
 		"acc": {},          # acc_id -> true
-		"loadouts": {},     # "char:skin_id" -> {slot: acc_id}
+		"loadouts": {},     # P1: "char:skin_id" | P2-P4: "p<n>:char:skin_id" -> {slot: acc_id}
 		"last_cskin": {},   # "char" -> skin_id terakhir dipakai
 		"last_wskin": {},   # "weapon" -> skin_id terakhir dipakai
 		"pistol_skin": "",
@@ -46,6 +53,7 @@ static func _ensure() -> void:
 	if _loaded:
 		return
 	_loaded = true
+	_lo_cache.clear()
 	_profile = _blank()
 	var cfg := ConfigFile.new()
 	if cfg.load(SAVE_PATH) != OK:
@@ -60,6 +68,7 @@ static func _ensure() -> void:
 
 static func save() -> void:
 	_ensure()
+	_lo_cache.clear()
 	var cfg := ConfigFile.new()
 	cfg.set_value("profile", "data", _profile)
 	cfg.save(SAVE_PATH)
@@ -140,10 +149,10 @@ static func weapon_skin_info(weapon: String, sid: String) -> Array:
 
 
 static func acc_info(aid: String) -> Array:
-	for a in CosmeticsData.ACCESSORIES:
-		if String(a[0]) == aid:
-			return a
-	return []
+	if _acc_idx.is_empty():
+		for a in CosmeticsData.ACCESSORIES:
+			_acc_idx[String(a[0])] = a
+	return _acc_idx.get(aid, [])
 
 
 static func acc_list(slot: String = "") -> Array:
@@ -248,14 +257,18 @@ static func owned_counts() -> Dictionary:
 	}
 
 
-# ------------------------------------------------------------------ loadout aksesoris (per karakter + skin)
-static func _lk(ch: int, sid: String) -> String:
-	return "%d:%s" % [ch, sid]
+# ------------------------------------------------------------------ loadout aksesoris (per pemain + karakter + skin)
+## Kunci simpanan. P1 (pl = 0) memakai format lama "char:skin" supaya data lama tetap terbaca;
+## P2-P4 memakai "p<n>:char:skin". Jadi tiap pemain bisa punya set aksesoris sendiri di karakter + skin yang sama.
+static func _lk(ch: int, sid: String, pl: int = 0) -> String:
+	if pl <= 0:
+		return "%d:%s" % [ch, sid]
+	return "p%d:%d:%s" % [pl, ch, sid]
 
 
-static func loadout(ch: int, sid: String) -> Dictionary:
+static func loadout(ch: int, sid: String, pl: int = 0) -> Dictionary:
 	_ensure()
-	var lo: Dictionary = (_profile["loadouts"] as Dictionary).get(_lk(ch, sid), {})
+	var lo: Dictionary = (_profile["loadouts"] as Dictionary).get(_lk(ch, sid, pl), {})
 	var out: Dictionary = {}
 	for slot in SLOTS:
 		var aid: String = String(lo.get(slot, ""))
@@ -264,15 +277,27 @@ static func loadout(ch: int, sid: String) -> Dictionary:
 	return out
 
 
-static func set_acc(ch: int, sid: String, slot: String, aid: String) -> void:
+## Sama seperti loadout(), tapi hasilnya disimpan sampai data berubah (dipanggil tiap frame oleh UI).
+## JANGAN diubah isinya oleh pemanggil (pakai .duplicate() kalau perlu mengubah).
+static func loadout_cached(ch: int, sid: String, pl: int = 0) -> Dictionary:
+	_ensure()
+	var k: String = _lk(ch, sid, pl)
+	if _lo_cache.has(k):
+		return _lo_cache[k]
+	var d: Dictionary = loadout(ch, sid, pl)
+	_lo_cache[k] = d
+	return d
+
+
+static func set_acc(ch: int, sid: String, slot: String, aid: String, pl: int = 0) -> void:
 	_ensure()
 	var all: Dictionary = _profile["loadouts"]
-	var lo: Dictionary = all.get(_lk(ch, sid), {})
+	var lo: Dictionary = all.get(_lk(ch, sid, pl), {})
 	if aid == "":
 		lo.erase(slot)
 	else:
 		lo[slot] = aid
-	all[_lk(ch, sid)] = lo
+	all[_lk(ch, sid, pl)] = lo
 	_profile["loadouts"] = all
 	save()
 
@@ -302,21 +327,77 @@ static func set_last_wskin(weapon: String, sid: String) -> void:
 	save()
 
 
-## Skin pistol / pisau dipasang lewat INVENTORY (tidak ada di layar pilih karakter).
-static func equipped_extra(weapon: String) -> String:
-	_ensure()
-	var key: String = "pistol_skin" if weapon == "pistol" else "knife_skin"
-	var s: String = String(_profile[key])
-	return s if owns_wskin(weapon, s) else ""
-
-
-static func set_equipped_extra(weapon: String, sid: String) -> void:
-	_ensure()
-	_profile["pistol_skin" if weapon == "pistol" else "knife_skin"] = sid
-	save()
-
-
 # ------------------------------------------------------------------ tekstur
+## Minta Godot memuat tekstur di THREAD LATAR BELAKANG (tidak menghentikan game). Nanti load_tex() tinggal mengambilnya.
+## Dulu tekstur baru dimuat saat pertama kali digambar -> patah-patah tepat ketika animasi buka tab / karakter berjalan.
+static func prefetch(path: String) -> void:
+	if _tex_cache.has(path) or _prefetched.has(path):
+		return
+	_prefetched[path] = true
+	if ResourceLoader.exists(path):
+		ResourceLoader.load_threaded_request(path)
+
+
+## Antrian pemanasan: daftar file yang akan diminta dimuat di thread latar, sedikit demi sedikit per frame
+## (supaya selesainya tidak menumpuk di satu frame). Dipanggil dari MENU, jadi Shop/Inventory sudah siap saat dibuka.
+static var _warm_q: Array = []
+
+
+static func warm_build(ch: int, weapon: String) -> void:
+	_warm_q.clear()
+	_warm_q.append("res://scenes/shop.tscn")
+	_warm_q.append("res://scenes/inventory.tscn")
+	for i in Global.character_count():
+		var info: Array = Global.CHARACTERS[i]
+		_warm_q.append("res://assets/sprites/characters/%s/%s.png" % [info[0], info[1]])
+	for w in WEAPON_IDS:
+		_warm_q.append("res://assets/sprites/guns/p1/%s.png" % String(w))
+	if ch >= 0 and ch < Global.character_count():
+		for s in CosmeticsData.CHAR_SKINS:
+			_warm_q.append("res://assets/sprites/skins/%s/%s.png" % [char_name(ch), String(s[0])])
+	for s in weapon_skin_list(weapon):
+		_warm_q.append("res://assets/sprites/weaponskins/%s/%s.png" % [weapon, String(s[0])])
+	for a in CosmeticsData.ACCESSORIES:
+		_warm_q.append("res://assets/sprites/accessories/%s.png" % String(a[0]))
+
+
+## Minta n file dari antrian. Return true kalau antrian sudah habis.
+static func warm_step(n: int) -> bool:
+	var k: int = 0
+	while k < n and not _warm_q.is_empty():
+		prefetch(String(_warm_q.pop_front()))
+		k += 1
+	return _warm_q.is_empty()
+
+
+static func prefetch_accessories() -> void:
+	for a in CosmeticsData.ACCESSORIES:
+		prefetch("res://assets/sprites/accessories/%s.png" % String(a[0]))
+
+
+static func prefetch_char_skins(ch: int) -> void:
+	if ch < 0 or ch >= Global.character_count():
+		return
+	for s in CosmeticsData.CHAR_SKINS:
+		prefetch("res://assets/sprites/skins/%s/%s.png" % [char_name(ch), String(s[0])])
+
+
+static func prefetch_weapon_skins(weapon: String) -> void:
+	for s in weapon_skin_list(weapon):
+		prefetch("res://assets/sprites/weaponskins/%s/%s.png" % [weapon, String(s[0])])
+
+
+static func prefetch_base_chars() -> void:
+	for i in Global.character_count():
+		var info: Array = Global.CHARACTERS[i]
+		prefetch("res://assets/sprites/characters/%s/%s.png" % [info[0], info[1]])
+
+
+static func prefetch_base_weapons() -> void:
+	for w in WEAPON_IDS:
+		prefetch("res://assets/sprites/guns/p1/%s.png" % String(w))
+
+
 static func load_tex(path: String) -> Texture2D:
 	if _tex_cache.has(path):
 		return _tex_cache[path]
@@ -338,6 +419,19 @@ static func char_name(ch: int) -> String:
 
 ## Tekstur karakter dengan skin. sid "" = sprite asli (pakai Global.character_texture).
 static func char_tex(ch: int, sid: String, dead: bool = false, base_slot: int = 0) -> Texture2D:
+	if dead or base_slot != 0:
+		return _char_tex_raw(ch, sid, dead, base_slot)
+	var per: Dictionary = _cskin_tex_cache.get(sid, {})
+	if per.has(ch):
+		return per[ch]
+	var tx: Texture2D = _char_tex_raw(ch, sid, dead, base_slot)
+	if tx != null:
+		per[ch] = tx
+		_cskin_tex_cache[sid] = per
+	return tx
+
+
+static func _char_tex_raw(ch: int, sid: String, dead: bool, base_slot: int) -> Texture2D:
 	if sid == "":
 		return Global.character_texture(base_slot, ch, dead)
 	var path: String = "res://assets/sprites/skins/%s/%s%s.png" % [char_name(ch), sid, "_die" if dead else ""]
@@ -346,6 +440,19 @@ static func char_tex(ch: int, sid: String, dead: bool = false, base_slot: int = 
 
 
 static func weapon_tex(weapon: String, sid: String, base_player: int = 0) -> Texture2D:
+	if base_player != 0:
+		return _weapon_tex_raw(weapon, sid, base_player)
+	var per: Dictionary = _wskin_tex_cache.get(weapon, {})
+	if per.has(sid):
+		return per[sid]
+	var tx: Texture2D = _weapon_tex_raw(weapon, sid, base_player)
+	if tx != null:
+		per[sid] = tx
+		_wskin_tex_cache[weapon] = per
+	return tx
+
+
+static func _weapon_tex_raw(weapon: String, sid: String, base_player: int) -> Texture2D:
 	if sid == "":
 		return Global.weapon_texture(base_player, weapon)
 	var t: Texture2D = load_tex("res://assets/sprites/weaponskins/%s/%s.png" % [weapon, sid])
@@ -353,7 +460,12 @@ static func weapon_tex(weapon: String, sid: String, base_player: int = 0) -> Tex
 
 
 static func acc_tex(aid: String) -> Texture2D:
-	return load_tex("res://assets/sprites/accessories/%s.png" % aid)
+	if _acc_tex_cache.has(aid):
+		return _acc_tex_cache[aid]
+	var tx: Texture2D = load_tex("res://assets/sprites/accessories/%s.png" % aid)
+	if tx != null:
+		_acc_tex_cache[aid] = tx
+	return tx
 
 
 static func coin_tex() -> Texture2D:
@@ -396,8 +508,9 @@ static func attach_accessories(holder: Node2D, ch: int, lo: Dictionary) -> Array
 
 
 # ------------------------------------------------------------------ gabungan: pasang semua kosmetik ke Player
-## `sel` = entri Global.selections / fighter campaign: {"character", "weapon", "skin", "wskin"}.
-## Skin senjata utama diambil dari pilihan di layar pilih; pistol & pisau dari Inventory.
+## `sel` = entri Global.selections / fighter campaign: {"character", "weapon", "skin", "wskin", "pskin", "kskin"}.
+## Semua skin senjata (utama, pistol, pisau) dipilih di layar pilih fighter. Aksesoris diambil dari loadout
+## milik pemain ini (p.index) untuk karakter + skin yang dipakai.
 static func apply_to_player(p: Player, sel: Dictionary) -> void:
 	var ch: int = int(sel["character"])
 	var skin: String = String(sel.get("skin", last_cskin(ch)))
@@ -405,14 +518,14 @@ static func apply_to_player(p: Player, sel: Dictionary) -> void:
 		skin = ""
 	var ws: Dictionary = {}
 	var main_w: String = String(sel["weapon"])
-	var wsk: String = String(sel.get("wskin", last_wskin(main_w)))
+	var wsk: String = String(sel.get("wskin", ""))
 	if owns_wskin(main_w, wsk):
 		ws[main_w] = wsk
 	for extra in ["pistol", "knife"]:
-		var e: String = equipped_extra(extra)
-		if e != "":
+		var e: String = String(sel.get("pskin" if extra == "pistol" else "kskin", ""))
+		if e != "" and owns_wskin(extra, e):
 			ws[extra] = e
-	p.apply_cosmetics(skin, ws, loadout(ch, skin))
+	p.apply_cosmetics(skin, ws, loadout(ch, skin, int(p.index)))
 
 
 # ------------------------------------------------------------------ gambar aksesoris di UI (preview)

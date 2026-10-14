@@ -69,6 +69,7 @@ var char_idx: int = 0
 # ---- kosmetik (skin & aksesoris dari Shop/Inventory); kosong = tampilan asli
 var skin_id: String = ""                  # skin karakter
 var wskins: Dictionary = {}               # weapon_id -> skin_id
+var loadout_data: Dictionary = {}         # aksesoris yang terpasang (slot -> acc_id), milik pemain ini
 var acc_nodes: Array = []                 # sprite aksesoris yang terpasang
 var weapon_id: String = "smith"      # senjata utama pilihan pemain (smith / kurval / flamer / scream)
 var game: Node = null
@@ -536,6 +537,7 @@ func weapon_tex_for(weapon: String) -> Texture2D:
 func apply_cosmetics(skin: String, weapon_skins: Dictionary, loadout: Dictionary) -> void:
 	skin_id = skin
 	wskins = weapon_skins.duplicate()
+	loadout_data = loadout.duplicate()
 	for n in acc_nodes:
 		if is_instance_valid(n):
 			(n as Node).queue_free()

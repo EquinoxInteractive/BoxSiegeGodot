@@ -3,8 +3,9 @@ extends Control
 ## Layar SHOP dan INVENTORY (satu basis kode, dua scene: shop.tscn & inventory.tscn).
 ##
 ## SHOP      : beli skin karakter / skin senjata / aksesoris dengan koin.
-## INVENTORY : lihat koleksi (yang dimiliki & yang masih terkunci), pasang aksesoris per karakter + per skin,
-##             lihat skin senjata, dan ganti skin PISTOL / PISAU (dua senjata ini tidak ada di layar pilih karakter).
+## INVENTORY : lihat koleksi (yang dimiliki & yang masih terkunci) dan pasang aksesoris PER PEMAIN (P1-P4) + per karakter
+##             + per skin. Skin senjata di sini hanya untuk DILIHAT; skin senjata utama, pistol dan pisau dipilih
+##             di layar FIGHTER SELECT.
 ##
 ## Navigasi (keyboard / controller / mouse):
 ##   atas/bawah = pindah baris (TAB -> pemilih -> kotak item)     kiri/kanan = ganti nilai / pindah kartu
@@ -33,12 +34,15 @@ var sel_skin: int = 0                 # indeks di [""] + skin yang dimiliki (inv
 var sel_weapon: int = 0
 var stage: int = 0                   # 0 = pilih KARAKTER / SENJATA, 1 = daftar SKIN-nya (hanya tab cskin & wskin)
 var sel_slot: int = 0                 # shop: 0 = ALL, 1..4 slot ; inventory: 0..3 slot
+var sel_pl: int = 0                   # INVENTORY: pemain (0..3 = P1..P4) yang aksesorisnya sedang diatur
+var plr_f: float = 0.0                # posisi sorotan chip pemain (halus)
 var t: float = 0.0
 var coins_shown: float = 0.0
 var coin_shake: float = 0.0
 var stamp_t: float = 0.0
 var stamp_text: String = ""
 var leaving: bool = false
+var back_focus: bool = false          # kursor keyboard / controller sedang berada di tombol BACK (kiri bawah)
 
 # --- animasi
 var grid_t: float = -0.15             # waktu animasi kartu grid (negatif = tertunda)
@@ -84,6 +88,60 @@ var prompt: UIKit.PromptBar
 var _hits: Array = []
 var _items_cache: Array = []
 var _intro: float = 0.0
+# --- cache performa: dihitung ulang hanya saat data berubah (_relayout), bukan tiap frame
+var _counts: Dictionary = {}
+var _sub_text: String = ""
+var _fit_cache: Dictionary = {}
+const WARM_SFX := ["ui_confirm", "ui_whoosh", "ui_panel", "ui_marimba", "ui_back", "ui_error", "ui_hover", "ui_move"]
+# pemanasan sekali per game: dimulai dari MENU (lewat DockButton) atau dari Shop/Inventory kalau dibuka langsung
+static var _mw_state: int = 0          # 0 = belum, 1 = berjalan, 2 = selesai
+static var _mw_sfx: int = 0
+static var _mw_frame: int = -1         # frame terakhir yang sudah diproses (dua DockButton tidak boleh menjalankan tick dobel)
+static var _mw_skip: int = 0           # berapa frame berturut-turut ditahan karena frame sedang berat
+static var _mw_glyph_go: bool = false  # true = pemuatan sudah habis, huruf boleh dipanaskan
+const MW_MAX_FRAME := 0.030            # frame lebih lama dari ini (detik) -> pemanasan ditahan dulu
+const MW_MAX_SKIP := 8                 # batas penahanan berturut-turut (supaya tetap selesai di PC lemah)
+
+
+## True selama pemanasan menu masih berjalan (dipakai Global supaya pemanasan GPU tidak menumpuk dengannya).
+static func menu_warm_pending() -> bool:
+	return _mw_state == 1
+
+
+static func menu_warm_begin(host: Node) -> void:
+	if _mw_state != 0:
+		return
+	_mw_state = 1
+	var ch: int = 0
+	var sf: Dictionary = CampaignData.saved_fighter()
+	if not sf.is_empty():
+		ch = int(sf["character"])
+	Cosmetics.warm_build(ch, String(Cosmetics.WEAPON_IDS[0]))
+	host.add_child(GlyphWarm.new())     # huruf berkontur dipanaskan di luar layar
+
+
+## Dipanggil tiap frame oleh DockButton. Dulu: 3 file per frame sejak frame pertama menu (menumpuk dengan intro menu
+## dan preload Global -> FPS anjlok). Sekarang: menunggu preload Global selesai, lalu 1 file per frame, dan ditahan
+## kalau frame sedang berat.
+static func menu_warm_tick(d: float = 0.016) -> void:
+	if _mw_state != 1:
+		return
+	var fr: int = Engine.get_process_frames()
+	if fr == _mw_frame:
+		return
+	_mw_frame = fr
+	if not Global.background_idle():
+		return
+	if d > MW_MAX_FRAME and _mw_skip < MW_MAX_SKIP:
+		_mw_skip += 1
+		return
+	_mw_skip = 0
+	var done: bool = Cosmetics.warm_step(1)
+	if _mw_sfx < WARM_SFX.size():
+		Global.get_sfx(String(WARM_SFX[_mw_sfx]))      # muat suara UI satu per frame
+		_mw_sfx += 1
+	if done and _mw_sfx >= WARM_SFX.size():
+		_mw_glyph_go = true        # GlyphWarm yang menandai _mw_state = 2 setelah selesai
 
 
 func _init() -> void:
@@ -121,6 +179,8 @@ func _ready() -> void:
 	back_btn.position = Vector2(10, 662)
 	back_btn.accent = Color("ff7a7a")
 	back_btn.activated.connect(_go_back)
+	back_btn.auto_hover = true          # efek hover mouse: geser + menyala + kilau + kursor tangan
+	back_btn.idle_alpha = 0.85
 	back_btn.modulate.a = 0.85
 	add_child(back_btn)
 
@@ -134,6 +194,13 @@ func _ready() -> void:
 	dlg_prompt.set_prompts([[&"dpad", "CHOOSE"], [&"none", "ACCEPT = CONFIRM"], [&"back", "CANCEL"]])
 
 	UIInput.pressed.connect(_on_input)
+	# muat semua tekstur yang akan dipakai di THREAD LATAR sekarang, supaya animasi buka tab tidak patah-patah
+	Cosmetics.prefetch_base_chars()
+	Cosmetics.prefetch_base_weapons()
+	Cosmetics.prefetch_accessories()
+	Cosmetics.prefetch_char_skins(sel_char)
+	Cosmetics.prefetch_weapon_skins(cur_weapon())
+	menu_warm_begin(self)             # kalau menu sudah memanaskan semuanya, ini tidak melakukan apa-apa
 	cur = 0                           # daftar karakter / senjata selalu mulai dari paling atas
 	_update_prompt()
 	_relayout()
@@ -176,6 +243,10 @@ func _pick_cursor() -> int:
 func _update_prompt() -> void:
 	if prompt == null:
 		return
+	if back_focus:
+		var bt: String = "BACK TO LIST" if (is_two_stage() and stage >= 1) else "BACK"
+		prompt.set_prompts([[&"dpad", "MOVE"], [&"none", "ACCEPT = %s" % bt], [&"back", bt]])
+		return
 	var acc_txt: String = "BUY" if shop_mode else "EQUIP"
 	if picking():
 		acc_txt = "OPEN"
@@ -197,7 +268,10 @@ func tab_title(k: String) -> String:
 func sel_names() -> Array:
 	match kind():
 		"cskin", "wskin": return []        # tidak ada pemilih geser kiri/kanan: pilih lewat kotak karakter / senjata
-		"char": return ["SLOT"] if stage == 2 else []   # INVENTORY: tahap 1 = daftar skin, tahap 2 = kustomisasi aksesoris
+		"char":   # INVENTORY: tahap 1 = daftar skin (+ pemilih PLAYER), tahap 2 = kustomisasi aksesoris (PLAYER + SLOT)
+			if stage == 2:
+				return ["PLAYER", "SLOT"]
+			return ["PLAYER"] if stage == 1 else []
 	if shop_mode:
 		return ["TYPE"]
 	return ["CHARACTER", "SKIN", "SLOT"]
@@ -247,6 +321,7 @@ func sel_text(i: int) -> String:
 	match nm:
 		"CHARACTER": return Global.character_name(0, sel_char)
 		"WEAPON": return String(Global.WEAPONS[cur_weapon()]["name"])
+		"PLAYER": return "P%d" % (sel_pl + 1)
 		"TYPE": return String(SLOT_FILTERS[sel_slot])
 		"SKIN":
 			var sid: String = cur_skin_id()
@@ -269,7 +344,10 @@ func sel_step(i: int, dir: int) -> void:
 			sel_skin = posmod(sel_skin + dir, skin_ids().size())
 		"SLOT":
 			sel_slot = posmod(sel_slot + dir, Cosmetics.SLOTS.size())
-	if nm != "SKIN":
+		"PLAYER":
+			sel_pl = posmod(sel_pl + dir, 4)
+			panel_t = 0.0
+	if nm != "SKIN" and nm != "PLAYER":
 		cur = 0
 		scroll_to = 0.0
 		_repop()
@@ -312,18 +390,14 @@ func _build_items() -> Array:
 					"owned": Cosmetics.owns_skin(sel_char, sid), "ch": sel_char})
 		"wskin":
 			var w: String = cur_weapon()
-			if not shop_mode and (w == "pistol" or w == "knife"):
-				out.append({"kind": "wskin", "id": "", "name": "DEFAULT", "rarity": "common", "price": 0, "owned": true, "w": w,
-					"equipped": Cosmetics.equipped_extra(w) == ""})
 			for s in Cosmetics.weapon_skin_list(w):
 				var sid2: String = String(s[0])
 				out.append({"kind": "wskin", "id": sid2, "name": String(s[1]), "rarity": String(s[2]), "price": int(s[3]),
-					"owned": Cosmetics.owns_wskin(w, sid2), "w": w,
-					"equipped": (w == "pistol" or w == "knife") and Cosmetics.equipped_extra(w) == sid2})
+					"owned": Cosmetics.owns_wskin(w, sid2), "w": w})
 		"acc", "char":
 			var lo: Dictionary = {}
 			if not shop_mode:
-				lo = Cosmetics.loadout(sel_char, cur_skin_id())
+				lo = Cosmetics.loadout_cached(sel_char, cur_skin_id(), sel_pl)
 				out.append({"kind": "acc", "id": "", "name": "NONE", "rarity": "common", "price": 0, "owned": true,
 					"slot": String(Cosmetics.SLOTS[sel_slot]), "equipped": not lo.has(String(Cosmetics.SLOTS[sel_slot])), "none": true})
 			for a in CosmeticsData.ACCESSORIES:
@@ -342,6 +416,7 @@ func _refresh() -> void:
 	_items_cache = _build_items()
 	cur = clampi(cur, 0, maxi(_items_cache.size() - 1, 0))
 	_relayout()
+	_prefetch_cursor()
 	queue_redraw()
 
 
@@ -356,18 +431,23 @@ func card_size() -> Vector2:
 ## Jumlah baris di atas grid: pemilih (tab aksesoris) atau satu bar "BACK + nama" saat di dalam karakter/senjata.
 func bar_count() -> int:
 	if is_two_stage():
-		return 1 if stage >= 1 else 0
+		if stage >= 1:
+			return 2 if (kind() == "char" and not shop_mode) else 1     # bar BACK + baris pemilih PLAYER
+		return 0
 	return sel_names().size()
 
 
 func grid_top() -> float:
 	if kind() == "char" and stage == 2:
-		return 226.0
+		return 266.0
 	return 138.0 + float(bar_count()) * 40.0 + 6.0
 
 
 func _relayout() -> void:
 	_items_cache = _build_items()
+	_counts = Cosmetics.owned_counts()
+	_sub_text = "SPEND YOUR COINS ON STYLE" if shop_mode else "OWNED   SKINS %d/%d   WEAPON %d/%d   ACC %d/%d" % [
+		int(_counts["skins"]), int(_counts["skins_total"]), int(_counts["wskins"]), int(_counts["wskins_total"]), int(_counts["acc"]), int(_counts["acc_total"])]
 	if grid != null:
 		grid.position = Vector2(GRID_X - GRID_PAD, grid_top() - GRID_PAD)
 		grid.size = Vector2(GRID_W + GRID_PAD * 2.0, BOTTOM - grid_top() + GRID_PAD * 2.0)
@@ -427,15 +507,9 @@ func _update_action_btn() -> void:
 				action_btn.disabled = true
 			action_btn.accent = UIKit.GREEN if bool(it.get("equipped", false)) else UIKit.GOLD
 		elif k == "wskin":
-			var w: String = String(it.get("w", ""))
-			if w == "pistol" or w == "knife":
-				action_btn.text = "EQUIPPED" if bool(it.get("equipped", false)) else "EQUIP"
-				action_btn.disabled = bool(it.get("equipped", false))
-				action_btn.accent = UIKit.GREEN if bool(it.get("equipped", false)) else UIKit.GOLD
-			else:
-				action_btn.text = "OWNED"
-				action_btn.disabled = true
-				action_btn.accent = UIKit.GREEN
+			action_btn.text = "OWNED"          # INVENTORY: skin senjata hanya untuk dilihat
+			action_btn.disabled = true
+			action_btn.accent = UIKit.GREEN
 		else:
 			action_btn.text = "CUSTOMIZE"
 			action_btn.accent = UIKit.CYAN
@@ -474,6 +548,22 @@ func _on_input(_source: int, action: StringName) -> void:
 			&"back":
 				_dialog_answer(false)
 		return
+	if back_focus:
+		# kursor ada di tombol BACK: ACCEPT = kembali, UP / RIGHT = balik ke daftar
+		match action:
+			&"accept":
+				_go_back()
+				return
+			&"back":
+				_go_back()
+				return
+			&"up", &"right":
+				_focus_back(false)
+				return
+			&"prev", &"next":
+				_focus_back(false)      # lanjut: ganti tab seperti biasa
+			_:
+				return
 	match action:
 		&"up":
 			_move_row(-1)
@@ -515,6 +605,7 @@ func _move_row(dir: int) -> void:
 				if cur / c < (_items_cache.size() - 1) / c:
 					nc = _items_cache.size() - 1
 				else:
+					_focus_back(true)       # sudah di baris paling bawah: lanjut ke tombol BACK
 					return
 			cur = nc
 			Global.play_sfx("ui_move", -12.0)
@@ -539,6 +630,9 @@ func _move_h(dir: int) -> void:
 	else:
 		if _items_cache.is_empty():
 			return
+		if dir < 0 and cur % cols() == 0 and cur / cols() >= (_items_cache.size() - 1) / cols():
+			_focus_back(true)           # kolom paling kiri di baris paling bawah: kiri lagi = tombol BACK
+			return
 		var nc: int = clampi(cur + dir, 0, _items_cache.size() - 1)
 		if nc != cur:
 			cur = nc
@@ -548,9 +642,33 @@ func _move_h(dir: int) -> void:
 	queue_redraw()
 
 
+## Pindahkan kursor keyboard / controller ke tombol BACK (on) atau kembalikan ke grid (off).
+func _focus_back(on: bool) -> void:
+	if back_focus == on:
+		return
+	back_focus = on
+	if back_btn != null:
+		back_btn.set_selected(on)
+	Global.play_sfx("ui_hover", -9.0)
+	_update_prompt()
+	queue_redraw()
+	if grid != null:
+		grid.queue_redraw()
+
+
+func _clear_back_focus() -> void:
+	if not back_focus:
+		return
+	back_focus = false
+	if back_btn != null:
+		back_btn.set_selected(false)
+	_update_prompt()
+
+
 func _set_tab(i: int) -> void:
 	if trans_active:
 		return
+	_clear_back_focus()
 	if i == tab:
 		if stage >= 1:
 			_exit_stage()
@@ -635,6 +753,7 @@ func _finish_enter() -> void:
 func _exit_stage() -> void:
 	if trans_active:
 		return
+	_clear_back_focus()
 	trans_active = true
 	trans_t = 0.0
 	trans_kind = "exit"
@@ -668,7 +787,20 @@ func _finish_exit() -> void:
 	UIKit.ring(self, trans_origin, Color(1, 1, 1, 0.9), 150.0, 0.45)
 
 
+## Saat memilih karakter / senjata: muat dulu skin milik kartu yang disorot (dan tetangganya) di thread latar.
+func _prefetch_cursor() -> void:
+	if not picking() or _items_cache.is_empty():
+		return
+	for d in [0, 1, -1]:
+		var it: Dictionary = _items_cache[clampi(cur + int(d), 0, _items_cache.size() - 1)]
+		if it.has("ch"):
+			Cosmetics.prefetch_char_skins(int(it["ch"]))
+		elif it.has("w"):
+			Cosmetics.prefetch_weapon_skins(String(it["w"]))
+
+
 func _follow_cursor() -> void:
+	_prefetch_cursor()
 	var cs: Vector2 = card_size()
 	var r: int = cur / cols()
 	var top: float = float(r) * (cs.y + 12.0)
@@ -715,25 +847,20 @@ func _activate() -> void:
 		var sid: String = cur_skin_id()
 		var slot: String = String(it["slot"])
 		if bool(it.get("none", false)):
-			Cosmetics.set_acc(sel_char, sid, slot, "")
+			Cosmetics.set_acc(sel_char, sid, slot, "", sel_pl)
 		elif bool(it.get("equipped", false)):
-			Cosmetics.set_acc(sel_char, sid, slot, "")
+			Cosmetics.set_acc(sel_char, sid, slot, "", sel_pl)
 		else:
-			Cosmetics.set_acc(sel_char, sid, slot, String(it["id"]))
+			Cosmetics.set_acc(sel_char, sid, slot, String(it["id"]), sel_pl)
 			stamp("EQUIPPED")
 		Global.play_sfx("ui_confirm", -6.0)
 		_burst_preview(Color("4fd8ff"))
 		_refresh()
 	elif k == "wskin":
+		# INVENTORY: skin senjata hanya untuk dilihat. Skin senjata utama, pistol dan pisau dipilih di FIGHTER SELECT.
 		var w: String = String(it.get("w", ""))
-		if w == "pistol" or w == "knife":
-			Cosmetics.set_equipped_extra(w, String(it["id"]))
-			Global.play_sfx("ui_confirm", -6.0)
-			stamp("EQUIPPED")
-			_burst_preview(Color("ffcd3c"))
-			_refresh()
-		else:
-			UIInput.toast("PICK IT IN FIGHTER SELECT", "%s skins are chosen after you pick the weapon" % String(Global.WEAPONS[w]["name"]), UIKit.GOLD)
+		Global.play_sfx("ui_hover", -9.0)
+		UIInput.toast("VIEW ONLY", "Pick %s skins in FIGHTER SELECT" % String(Global.WEAPONS[w]["name"]), UIKit.GOLD)
 
 
 func _deny(title: String, sub: String) -> void:
@@ -909,14 +1036,22 @@ func _gui_input(event: InputEvent) -> void:
 func _on_hit(type: String, a: int) -> void:
 	if dlg_open:
 		return
+	_clear_back_focus()
 	match type:
 		"tab":
 			row = 0
 			_set_tab(a)
 		"crumb":
 			_exit_stage()
-		"slot":
+		"plr":
 			row = 1
+			if a != sel_pl:
+				sel_pl = a
+				panel_t = 0.0
+				Global.play_sfx("ui_move", -10.0)
+				_refresh()
+		"slot":
+			row = 2
 			if a != sel_slot:
 				sel_slot = a
 				cur = 0
@@ -937,13 +1072,17 @@ func _on_hit(type: String, a: int) -> void:
 			else:
 				cur = a
 				Global.play_sfx("ui_move", -12.0)
+				_prefetch_cursor()
 				_update_action_btn()
 	queue_redraw()
 
 
 # ------------------------------------------------------------------ frame
 func _process(d: float) -> void:
+	# kalau satu frame sempat berat (mis. frame pertama setelah layar dibuka), animasi tidak melompat maju: lanjut mulus
+	d = minf(d, 1.0 / 30.0)
 	t += d
+	menu_warm_tick()
 	_intro = minf(_intro + d, 2.0)
 	if trans_active:
 		trans_t += d / (0.26 if trans_kind == "enter" else 0.2)
@@ -963,6 +1102,7 @@ func _process(d: float) -> void:
 	tab_f = lerpf(tab_f, float(tab), minf(1.0, d * 14.0))
 	tab_focus_f = lerpf(tab_focus_f, 1.0 if (row == 0 and not dlg_open) else 0.0, minf(1.0, d * 12.0))
 	pill_f = lerpf(pill_f, float(sel_slot), minf(1.0, d * 14.0))
+	plr_f = lerpf(plr_f, float(sel_pl), minf(1.0, d * 14.0))
 	_track_panel()
 	if dlg_layer != null:
 		dlg_layer.queue_redraw()
@@ -976,6 +1116,7 @@ func _process(d: float) -> void:
 	if absf(scroll - scroll_to) < 0.4:
 		scroll = scroll_to
 	action_btn.mouse_filter = Control.MOUSE_FILTER_IGNORE if dlg_open else Control.MOUSE_FILTER_STOP
+	back_btn.mouse_filter = Control.MOUSE_FILTER_IGNORE if dlg_open else Control.MOUSE_FILTER_STOP
 	queue_redraw()
 	if grid != null:
 		grid.queue_redraw()
@@ -1069,10 +1210,7 @@ func _draw_header() -> void:
 		DockButton.draw_shop_icon(self, Vector2(300.0 + xo, 43.0), 40.0, t)
 	else:
 		DockButton.draw_chest_icon(self, Vector2(300.0 + xo, 43.0), 40.0, t, 0.5)
-	var cnt: Dictionary = Cosmetics.owned_counts()
-	var sub: String = "SPEND YOUR COINS ON STYLE" if shop_mode else "OWNED   SKINS %d/%d   WEAPON %d/%d   ACC %d/%d" % [
-		int(cnt["skins"]), int(cnt["skins_total"]), int(cnt["wskins"]), int(cnt["wskins_total"]), int(cnt["acc"]), int(cnt["acc_total"])]
-	UIKit.text_in(self, sub, Rect2(372.0, 24.0, 600.0, 36.0), 18, Color(1, 1, 1, 0.7), HORIZONTAL_ALIGNMENT_LEFT, 4)
+	UIKit.text_in(self, _sub_text, Rect2(372.0, 24.0, 600.0, 36.0), 18, Color(1, 1, 1, 0.7), HORIZONTAL_ALIGNMENT_LEFT, 4)
 	# saldo koin
 	var sh: float = sin(t * 60.0) * 7.0 * coin_shake
 	var cp := UIKit.slanted(250.0, 52.0, 16.0, 1004.0 + sh, 16.0)
@@ -1084,7 +1222,7 @@ func _draw_header() -> void:
 
 
 func _draw_tabs() -> void:
-	var cnt: Dictionary = Cosmetics.owned_counts()
+	var cnt: Dictionary = _counts
 	var gc: Color = UIKit.GOLD if shop_mode else Color("a58cff")
 	for i in kinds.size():
 		var r := Rect2(GRID_X + float(i) * 276.0, 84.0, 266.0, 44.0)
@@ -1171,40 +1309,136 @@ func _draw_crumb() -> void:
 	var nm: String = Global.character_name(0, sel_char) if kind() != "wskin" else String(Global.WEAPONS[cur_weapon()]["name"])
 	if custom:
 		nm += "  /  " + sel_text(-1)
-		UIKit.text_in(self, "CUSTOMIZE", Rect2(r.end.x - 150.0, y, 130.0, 34.0), 15, UIKit.CYAN, HORIZONTAL_ALIGNMENT_RIGHT, 3)
+		UIKit.text_in(self, "P%d  CUSTOMIZE" % (sel_pl + 1), Rect2(r.end.x - 190.0, y, 170.0, 34.0), 15, Global.PLAYER_COLORS[sel_pl].lightened(0.35), HORIZONTAL_ALIGNMENT_RIGHT, 3)
 	UIKit.text_in(self, nm, Rect2(vx, y, r.end.x - 160.0 - vx, 34.0), _fit(nm, r.end.x - 160.0 - vx, 24), Color.WHITE, HORIZONTAL_ALIGNMENT_LEFT, 5)
 	_hits.append({"rect": r, "type": "crumb", "a": 0})
 
 
+## Pemilih PEMAIN (P1-P4): aksesoris disimpan terpisah untuk tiap pemain pada karakter + skin yang sama.
+## Titik kecil di tiap chip menunjukkan berapa slot aksesoris yang sudah dipasang pemain itu (karakter + skin yang disorot).
+func _draw_player_row() -> void:
+	var y: float = 180.0
+	var on_row: bool = row == 1
+	var r := Rect2(GRID_X, y, 600.0, 34.0)
+	var vis: float = _stage_vis(0.1)
+	var yy: float = y + (1.0 - vis) * 30.0
+	var bpts := UIKit.slanted(r.size.x, r.size.y, 10.0, r.position.x, yy)
+	draw_colored_polygon(bpts, Color(0.05, 0.05, 0.12, 0.85))
+	draw_polyline(UIKit.closed(bpts), UIKit.GOLD if on_row else Color(1, 1, 1, 0.16), 3.0 if on_row else 2.0, true)
+	UIKit.text_in(self, "PLAYER", Rect2(r.position.x + 22.0, yy, 100.0, 34.0), 15, Color(1, 1, 1, 0.6), HORIZONTAL_ALIGNMENT_LEFT, 3)
+	var cw: float = 104.0
+	var cg: float = 8.0
+	var cx0: float = r.position.x + 124.0
+	var sid: String = cur_skin_id()
+	# sorotan meluncur di belakang chip aktif
+	var hc: Color = Global.PLAYER_COLORS[clampi(sel_pl, 0, 3)]
+	var hx: float = cx0 + plr_f * (cw + cg)
+	var hpts := UIKit.slanted(cw, 28.0, 8.0, hx, yy + 3.0)
+	draw_polygon(hpts, PackedColorArray([hc.lightened(0.25), hc.lightened(0.25), hc.darkened(0.35), hc.darkened(0.35)]))
+	draw_polyline(UIKit.closed(hpts), Color.WHITE.lerp(UIKit.GOLD, 0.5 + 0.5 * sin(t * 6.0)) if on_row else Color(1, 1, 1, 0.85), 3.0 if on_row else 2.0, true)
+	for i in 4:
+		var x: float = cx0 + float(i) * (cw + cg)
+		var pc: Color = Global.PLAYER_COLORS[i]
+		var on: bool = absf(float(i) - plr_f) < 0.5
+		if not on:
+			var cpts := UIKit.slanted(cw, 28.0, 8.0, x, yy + 3.0)
+			draw_colored_polygon(cpts, Color(pc.r, pc.g, pc.b, 0.22))
+			draw_polyline(UIKit.closed(cpts), Color(pc.r, pc.g, pc.b, 0.55), 2.0, true)
+		UIKit.text_in(self, "P%d" % (i + 1), Rect2(x + 12.0, yy, 44.0, 34.0), 22, Color.WHITE if on else Color(1, 1, 1, 0.8), HORIZONTAL_ALIGNMENT_LEFT, 5)
+		# titik slot terpasang (HEAD / FACE / NECK / BACK) untuk pemain ini
+		var plo: Dictionary = Cosmetics.loadout_cached(sel_char, sid, i)
+		for k in Cosmetics.SLOTS.size():
+			var dc := Vector2(x + 56.0 + float(k) * 10.0, yy + 17.0)
+			if plo.has(String(Cosmetics.SLOTS[k])):
+				draw_circle(dc, 3.6, UIKit.GREEN)
+				draw_arc(dc, 3.6, 0.0, TAU, 12, Color(0, 0, 0, 0.7), 1.2, true)
+			else:
+				draw_arc(dc, 3.0, 0.0, TAU, 12, Color(1, 1, 1, 0.45 if on else 0.28), 1.6, true)
+		_hits.append({"rect": Rect2(x, y, cw, 34.0), "type": "plr", "a": i})
+	var pul: float = 1.0 + (0.25 * sin(t * 6.0) if on_row else 0.0)
+	var cc: Color = Color(UIKit.GOLD, 1.0) if on_row else Color(1, 1, 1, 0.4)
+	UIKit.draw_chevron(self, Vector2(cx0 - 14.0, yy + 17.0), 8.0 * pul, -1, cc)
+	UIKit.draw_chevron(self, Vector2(cx0 + 4.0 * (cw + cg) - 2.0, yy + 17.0), 8.0 * pul, 1, cc)
+
+
 ## Pilihan slot aksesoris (HEAD / FACE / NECK / BACK) dengan sorotan yang meluncur.
 func _draw_pills() -> void:
-	var y0: float = 182.0
+	var y0: float = 222.0
 	var pw: float = 146.0
+	var ph: float = 34.0
 	var gap: float = 8.0
-	var on_row: bool = row == 1
-	var lo: Dictionary = Cosmetics.loadout(sel_char, cur_skin_id())
+	var on_row: bool = row == 2 and not back_focus and not dlg_open
+	var lo: Dictionary = Cosmetics.loadout_cached(sel_char, cur_skin_id(), sel_pl)
 	var gc := Color("a58cff")
+	var tm: float = t
+	var pulse: float = 0.5 + 0.5 * sin(tm * 7.0)
+	var mp: Vector2 = get_local_mouse_position()
+	# --- pill biasa (yang tidak dipilih): meredup saat kursor ada di baris ini supaya yang aktif benar-benar menonjol,
+	#     dan menyala lembut kalau kursor MOUSE ada di atasnya
 	for i in Cosmetics.SLOTS.size():
 		var v: float = _stage_vis(0.22 + float(i) * 0.05)
 		var x: float = GRID_X + float(i) * (pw + gap)
 		var y: float = y0 + (1.0 - v) * 44.0
-		var pts := UIKit.slanted(pw, 34.0, 10.0, x, y)
-		draw_colored_polygon(pts, Color(0.05, 0.05, 0.12, 0.85))
-		draw_polyline(UIKit.closed(pts), Color(1, 1, 1, 0.16), 2.0, true)
-		_hits.append({"rect": Rect2(x, y0, pw, 34.0), "type": "slot", "a": i})
+		var hov: bool = not dlg_open and not trans_active and Rect2(x, y0, pw, ph).has_point(mp) and absf(float(i) - pill_f) >= 0.5
+		var pts := UIKit.slanted(pw, ph, 10.0, x, y)
+		draw_colored_polygon(pts, Color(0.03, 0.03, 0.08, 0.9) if (on_row and not hov) else (Color(0.12, 0.1, 0.24, 0.95) if hov else Color(0.05, 0.05, 0.12, 0.85)))
+		draw_polyline(UIKit.closed(pts), Color(gc.lightened(0.3), 0.85) if hov else Color(1, 1, 1, 0.1 if on_row else 0.16), 2.0, true)
+		if hov:
+			draw_colored_polygon(pts, Color(gc.r, gc.g, gc.b, 0.16 + 0.08 * pulse))
+		_hits.append({"rect": Rect2(x, y0, pw, ph), "type": "slot", "a": i})
+	# --- pill aktif (sorotan meluncur)
 	var vh: float = _stage_vis(0.3)
 	var hx: float = GRID_X + pill_f * (pw + gap)
-	var hp := UIKit.slanted(pw, 34.0, 10.0, hx, y0 + (1.0 - vh) * 44.0)
-	draw_polygon(hp, PackedColorArray([gc.lightened(0.2), gc.lightened(0.2), gc.darkened(0.35), gc.darkened(0.35)]))
-	draw_polyline(UIKit.closed(hp), Color(UIKit.GOLD if on_row else Color(1, 1, 1, 0.8)).lerp(Color.WHITE, 0.5 + 0.5 * sin(t * 6.0) if on_row else 0.0), 3.0, true)
+	var hy: float = y0 + (1.0 - vh) * 44.0
+	if on_row:
+		# kursor sedang di baris ini: pill membesar sedikit + naik, ada cahaya emas berdenyut, bingkai ganda, kilau menyapu,
+		# panah kiri / kanan, dan garis penanda di bawahnya
+		var g: float = 1.0
+		var grow: float = 4.0
+		var bx: float = hx - grow
+		var by: float = hy - grow - 2.0
+		var bw: float = pw + grow * 2.0
+		var bh: float = ph + grow * 2.0
+		# cahaya luar berlapis
+		for k in 4:
+			var e: float = float(k) * 4.0 + 4.0 + pulse * 3.0
+			var gp := UIKit.slanted(bw + e * 2.0, bh + e * 2.0, 10.0 + e * 0.3, bx - e, by - e)
+			draw_polyline(UIKit.closed(gp), Color(UIKit.GOLD, (0.34 - float(k) * 0.07) * g), 3.0, true)
+		draw_colored_polygon(UIKit.slanted(bw + 6.0, bh + 6.0, 11.0, bx - 3.0 + 3.0, by - 3.0 + 6.0), Color(0, 0, 0, 0.45))
+		var fp := UIKit.slanted(bw, bh, 11.0, bx, by)
+		var top: Color = gc.lightened(0.45)
+		var bot: Color = gc.darkened(0.15)
+		draw_polygon(fp, PackedColorArray([top, top, bot, bot]))
+		# kilau menyapu
+		var sx: float = bx + (fposmod(tm * 0.9, 1.8) - 0.4) * bw
+		var band := PackedVector2Array([Vector2(sx + 14.0, by), Vector2(sx + 40.0, by), Vector2(sx + 26.0, by + bh), Vector2(sx, by + bh)])
+		for piece in Geometry2D.intersect_polygons(band, fp):
+			draw_colored_polygon(piece, Color(1, 1, 1, 0.38))
+		# bingkai: putih tipis di dalam, emas tebal berkedip di luar
+		draw_polyline(UIKit.closed(fp), Color(UIKit.GOLD).lerp(Color.WHITE, pulse), 4.0, true)
+		draw_polyline(UIKit.closed(UIKit.slanted(bw - 8.0, bh - 8.0, 9.0, bx + 4.0, by + 4.0)), Color(1, 1, 1, 0.55), 1.5, true)
+		# garis penanda di bawah pill
+		draw_rect(Rect2(bx + 14.0, by + bh + 5.0, bw - 28.0, 4.0), Color(UIKit.GOLD, 0.6 + 0.4 * pulse))
+		# panah ganti slot (kiri / kanan) di tepi baris
+		var ch_pul: float = 1.0 + 0.25 * pulse
+		UIKit.draw_chevron(self, Vector2(GRID_X - 16.0 - pulse * 3.0, y0 + ph * 0.5), 9.0 * ch_pul, -1, UIKit.GOLD)
+		UIKit.draw_chevron(self, Vector2(GRID_X + 4.0 * (pw + gap) - 2.0 + pulse * 3.0, y0 + ph * 0.5), 9.0 * ch_pul, 1, UIKit.GOLD)
+	else:
+		var hp := UIKit.slanted(pw, ph, 10.0, hx, hy)
+		draw_polygon(hp, PackedColorArray([gc.lightened(0.2), gc.lightened(0.2), gc.darkened(0.35), gc.darkened(0.35)]))
+		draw_polyline(UIKit.closed(hp), Color(1, 1, 1, 0.8), 3.0, true)
+	# --- teks + titik terpasang
 	for i in Cosmetics.SLOTS.size():
 		var v: float = _stage_vis(0.22 + float(i) * 0.05)
 		var slot: String = String(Cosmetics.SLOTS[i])
 		var x: float = GRID_X + float(i) * (pw + gap)
 		var y: float = y0 + (1.0 - v) * 44.0
 		var on: bool = absf(float(i) - pill_f) < 0.5
-		UIKit.text_in(self, String(Cosmetics.SLOT_NAMES[slot]), Rect2(x + 14.0, y, pw - 40.0, 34.0), 20, Color(0.08, 0.04, 0.16) if on else Color(1, 1, 1, 0.7), HORIZONTAL_ALIGNMENT_LEFT, 0 if on else 3)
-		var dc := Vector2(x + pw - 22.0, y + 17.0)
+		var lift: float = -2.0 if (on and on_row) else 0.0
+		var fsz: int = 23 if (on and on_row) else 20
+		var tcol: Color = Color(0.08, 0.04, 0.16) if on else Color(1, 1, 1, 0.55 if on_row else 0.7)
+		UIKit.text_in(self, String(Cosmetics.SLOT_NAMES[slot]), Rect2(x + 14.0, y + lift, pw - 40.0, ph), fsz, tcol, HORIZONTAL_ALIGNMENT_LEFT, 0 if on else 3)
+		var dc := Vector2(x + pw - 22.0, y + 17.0 + lift)
 		if lo.has(slot):
 			draw_circle(dc, 6.0, UIKit.GREEN)
 			draw_arc(dc, 6.0, 0.0, TAU, 16, Color(0, 0, 0, 0.7), 1.5, true)
@@ -1216,6 +1450,8 @@ func _draw_selectors() -> void:
 	if is_two_stage():
 		if stage >= 1:
 			_draw_crumb()
+			if kind() == "char" and not shop_mode:
+				_draw_player_row()
 			if kind() == "char" and stage == 2:
 				_draw_pills()
 		return
@@ -1311,7 +1547,7 @@ func _draw_panel() -> void:
 			var face := Rect2(-Vector2(100, 100) * ps, Vector2(200, 200) * ps)
 			var lo0: Dictionary = {}
 			if not shop_mode:
-				lo0 = Cosmetics.loadout(int(it["ch"]), String(it["id"]))
+				lo0 = Cosmetics.loadout_cached(int(it["ch"]), String(it["id"]), sel_pl)
 			Cosmetics.draw_preview(self, int(it["ch"]), String(it["id"]), lo0, face, tint)
 			draw_rect(face, Color(0, 0, 0, 0.9), false, 3.0)
 			draw_set_transform(Vector2.ZERO)
@@ -1339,7 +1575,7 @@ func _draw_panel() -> void:
 			if not shop_mode:
 				pc = sel_char
 				sid = cur_skin_id()
-				lo = Cosmetics.loadout(pc, sid).duplicate()
+				lo = Cosmetics.loadout_cached(pc, sid, sel_pl).duplicate()
 				var slot: String = String(it["slot"])
 				if bool(it.get("none", false)):
 					lo.erase(slot)
@@ -1394,10 +1630,10 @@ func _draw_panel() -> void:
 		"wskin":
 			d1 = "Bullets glow in this skin's color"
 			var w2: String = String(it["w"])
-			d2 = "Change it here in INVENTORY" if (w2 == "pistol" or w2 == "knife") else "Pick it after choosing the weapon"
+			d2 = "View only - pick it in FIGHTER SELECT" if not shop_mode else ("Pick it in FIGHTER SELECT after the weapon" if not (w2 == "pistol" or w2 == "knife") else "Pick it in FIGHTER SELECT (backup gun / knife)")
 		"acc":
 			d1 = "Fits every character and skin"
-			d2 = "Equip it per character in INVENTORY" if shop_mode else ("Each character + skin keeps its own set" if owned else "Preview only - buy it in the SHOP")
+			d2 = "Equip it per character in INVENTORY" if shop_mode else ("Each player + character + skin has its own set" if owned else "Preview only - buy it in the SHOP")
 	UIKit.text_in(self, d1, Rect2(px + 20.0, 520.0, 370.0, 22.0), 15, Color(1, 1, 1, 0.6), HORIZONTAL_ALIGNMENT_CENTER, 3)
 	UIKit.text_in(self, d2, Rect2(px + 20.0, 540.0, 370.0, 22.0), 15, Color(1, 1, 1, 0.45), HORIZONTAL_ALIGNMENT_CENTER, 3)
 	# cap besar (PURCHASED / EQUIPPED)
@@ -1413,9 +1649,14 @@ func _draw_panel() -> void:
 
 
 func _fit(s: String, maxw: float, fs: int) -> int:
-	while fs > 12 and UIKit.text_w(s, fs) > maxw:
-		fs -= 2
-	return fs
+	var key: String = "%s|%d|%d" % [s, int(maxw), fs]
+	if _fit_cache.has(key):
+		return int(_fit_cache[key])
+	var f: int = fs
+	while f > 12 and UIKit.text_w(s, f) > maxw:
+		f -= 2
+	_fit_cache[key] = f
+	return f
 
 
 func _fit_rect(tex: Texture2D, box: Rect2) -> Rect2:
@@ -1676,6 +1917,38 @@ func _draw_dialog(ci: CanvasItem) -> void:
 # ================================================================== grid item (dipotong sendiri)
 class GridView extends Control:
 	var ui: CosmeticUI
+	# bentuk kartu (relatif terhadap pojok kiri-atas kartu) dibuat SEKALI per ukuran kartu, bukan tiap frame
+	var _gk: Vector2 = Vector2.ZERO
+	var _g_pts: PackedVector2Array = PackedVector2Array()
+	var _g_shadow: PackedVector2Array = PackedVector2Array()
+	var _g_closed: PackedVector2Array = PackedVector2Array()
+	var _g_pip: PackedVector2Array = PackedVector2Array()
+	var _g_cols: Dictionary = {}          # rarity -> PackedColorArray gradasi kartu
+
+	func _ensure_geo(cs: Vector2) -> void:
+		if cs == _gk and not _g_pts.is_empty():
+			return
+		_gk = cs
+		var w: float = cs.x
+		var h: float = cs.y
+		var ch: float = 12.0
+		_g_pts = PackedVector2Array([Vector2(ch, 0), Vector2(w, 0), Vector2(w, h - ch), Vector2(w - ch, h), Vector2(0, h), Vector2(0, ch)])
+		_g_shadow = PackedVector2Array()
+		for q in _g_pts:
+			_g_shadow.append(q + Vector2(4, 6))
+		_g_closed = PackedVector2Array(_g_pts)
+		_g_closed.append(_g_pts[0])
+		_g_pip = PackedVector2Array([Vector2(w - 26, 0), Vector2(w, 0), Vector2(w, 26)])
+		_g_cols.clear()
+
+	func _cols_for(rarity: String, rc: Color) -> PackedColorArray:
+		if _g_cols.has(rarity):
+			return _g_cols[rarity]
+		var top: Color = Color(0.12, 0.12, 0.24, 0.95).lerp(rc.darkened(0.55), 0.4)
+		var bot: Color = Color(0.04, 0.04, 0.1, 0.96)
+		var arr := PackedColorArray([top, top, bot, bot, bot, top])
+		_g_cols[rarity] = arr
+		return arr
 
 	func _init() -> void:
 		clip_contents = true
@@ -1687,7 +1960,7 @@ class GridView extends Control:
 		var its: Array = ui.items()
 		var cs: Vector2 = ui.card_size()
 		var cn: int = ui.cols()
-		var on_grid: bool = ui.row == ui.grid_row()
+		var on_grid: bool = ui.row == ui.grid_row() and not ui.back_focus
 		var n: int = its.size()
 		var stag: float = minf(0.04, 0.5 / maxf(float(n), 1.0))
 		var late: int = -1
@@ -1749,29 +2022,25 @@ class GridView extends Control:
 			_draw_xf(its[late], Vector2(bx, by), cs, true, true, 1.0, Vector2.ZERO, 1.0 + 0.34 * u2, sin(ui.trans_t * PI * 2.0) * 0.08)
 
 	func _draw_xf(it: Dictionary, base: Vector2, cs: Vector2, sel: bool, active: bool, al: float, off: Vector2, sc: float, rot: float) -> void:
+		_ensure_geo(cs)
 		var c0: Vector2 = base + cs * 0.5
-		var xf := Transform2D(rot, Vector2(sc, sc), 0.0, c0 + off) * Transform2D(0.0, Vector2.ONE, 0.0, -c0)
+		var lift: float = -4.0 - 2.0 * sin(ui.t * 5.0) if active else (-2.0 if sel else 0.0)
+		# kartu digambar di koordinat lokal (0,0 = pojok kiri-atas); posisi + efek terangkat dimasukkan ke transform
+		var xf := Transform2D(rot, Vector2(sc, sc), 0.0, c0 + off) * Transform2D(0.0, Vector2.ONE, 0.0, -c0) * Transform2D(0.0, Vector2.ONE, 0.0, base + Vector2(0.0, lift))
 		draw_set_transform_matrix(xf)
-		_draw_card(it, base, cs, sel, active, al)
+		_draw_card(it, cs, sel, active, al)
 		draw_set_transform_matrix(Transform2D.IDENTITY)
 
-	func _draw_card(it: Dictionary, p: Vector2, cs: Vector2, sel: bool, active: bool, alpha: float) -> void:
-		var rc: Color = Cosmetics.rarity_color(String(it["rarity"]))
+	func _draw_card(it: Dictionary, cs: Vector2, sel: bool, active: bool, alpha: float) -> void:
+		var rarity: String = String(it["rarity"])
+		var rc: Color = Cosmetics.rarity_color(rarity)
 		var owned: bool = bool(it["owned"])
-		var lift: float = -4.0 - 2.0 * sin(ui.t * 5.0) if active else (-2.0 if sel else 0.0)
-		var o: Vector2 = p + Vector2(0, lift)
+		var o: Vector2 = Vector2.ZERO
 		var w: float = cs.x
-		var h: float = cs.y
-		var ch: float = 12.0
-		var pts := PackedVector2Array([o + Vector2(ch, 0), o + Vector2(w, 0), o + Vector2(w, h - ch), o + Vector2(w - ch, h), o + Vector2(0, h), o + Vector2(0, ch)])
-		draw_colored_polygon(PackedVector2Array([pts[0] + Vector2(4, 6), pts[1] + Vector2(4, 6), pts[2] + Vector2(4, 6), pts[3] + Vector2(4, 6), pts[4] + Vector2(4, 6), pts[5] + Vector2(4, 6)]), Color(0, 0, 0, 0.4 * alpha))
-		var top: Color = Color(0.12, 0.12, 0.24, 0.95).lerp(rc.darkened(0.55), 0.4)
-		var bot: Color = Color(0.04, 0.04, 0.1, 0.96)
-		draw_polygon(pts, PackedColorArray([top, top, bot, bot, bot, top]))
-		var closed_pts := PackedVector2Array(pts)
-		closed_pts.append(pts[0])
+		draw_colored_polygon(_g_shadow, Color(0, 0, 0, 0.4 * alpha))
+		draw_polygon(_g_pts, _cols_for(rarity, rc))
 		var bc: Color = Color(UIKit.GOLD, 1.0) if active else (Color(rc, 0.9) if sel else Color(rc, 0.55))
-		draw_polyline(closed_pts, bc, 4.0 if active else 2.0, true)
+		draw_polyline(_g_closed, bc, 4.0 if active else 2.0, true)
 		# thumbnail
 		var s: float = w - 20.0
 		var th := Rect2(o + Vector2(10, 10), Vector2(s, s))
@@ -1792,7 +2061,7 @@ class GridView extends Control:
 			"cskin":
 				var lo0: Dictionary = {}
 				if not ui.shop_mode:
-					lo0 = Cosmetics.loadout(int(it["ch"]), String(it["id"]))
+					lo0 = Cosmetics.loadout_cached(int(it["ch"]), String(it["id"]), ui.sel_pl)
 				Cosmetics.draw_preview(self, int(it["ch"]), String(it["id"]), lo0, th.grow(-2.0), tint)
 				draw_rect(th.grow(-2.0), Color(0, 0, 0, 0.85), false, 2.0)
 			"wskin":
@@ -1812,10 +2081,15 @@ class GridView extends Control:
 		if not owned and not ui.shop_mode:
 			UIKit.draw_lock(self, th.get_center(), 30.0, Color(1, 1, 1, 0.85))
 		# rarity pip
-		draw_colored_polygon(PackedVector2Array([o + Vector2(w - 26, 0), o + Vector2(w, 0), o + Vector2(w, 26)]), Color(rc, 0.95))
+		draw_colored_polygon(_g_pip, Color(rc, 0.95))
 		# nama + harga / status
 		var nm: String = String(it["name"])
-		UIKit.text_in(self, nm, Rect2(o.x + 4.0, o.y + s + 12.0, w - 8.0, 22.0), ui._fit(nm, w - 14.0, 17), Color(1, 1, 1, 0.95 if owned or ui.shop_mode else 0.5), HORIZONTAL_ALIGNMENT_CENTER, 4)
+		var nfs: int = int(it.get("_fs", 0))
+		if nfs == 0 or float(it.get("_fsw", 0.0)) != w:
+			nfs = ui._fit(nm, w - 14.0, 17)          # ukuran huruf nama dihitung sekali per kartu, bukan tiap frame
+			it["_fs"] = nfs
+			it["_fsw"] = w
+		UIKit.text_in(self, nm, Rect2(o.x + 4.0, o.y + s + 12.0, w - 8.0, 22.0), nfs, Color(1, 1, 1, 0.95 if owned or ui.shop_mode else 0.5), HORIZONTAL_ALIGNMENT_CENTER, 4)
 		var py: float = o.y + s + 34.0
 		var equipped: bool = bool(it.get("equipped", false))
 		if is_pick:
@@ -1825,8 +2099,12 @@ class GridView extends Control:
 				UIKit.text_in(self, "OWNED", Rect2(o.x, py, w, 22.0), 16, UIKit.GREEN, HORIZONTAL_ALIGNMENT_CENTER, 4)
 			else:
 				var pr: int = int(it["price"])
-				var txt: String = ui._fmt(pr)
-				var tw: float = UIKit.text_w(txt, 18)
+				var txt: String = String(it.get("_ptxt", ""))
+				if txt == "":
+					txt = ui._fmt(pr)
+					it["_ptxt"] = txt
+					it["_ptw"] = UIKit.text_w(txt, 18)
+				var tw: float = float(it["_ptw"])
 				var cc: Color = UIKit.GOLD if Cosmetics.can_afford(pr) else Color("ff7a7a")
 				CosmeticUI.draw_coin(self, Vector2(o.x + w * 0.5 - tw * 0.5 - 8.0, py + 11.0), 18.0)
 				UIKit.text_in(self, txt, Rect2(o.x + w * 0.5 - tw * 0.5 + 4.0, py, tw + 8.0, 22.0), 18, cc, HORIZONTAL_ALIGNMENT_LEFT, 4)
@@ -1840,6 +2118,58 @@ class GridView extends Control:
 		if owned and (equipped and not ui.shop_mode):
 			draw_circle(o + Vector2(20, 20), 11.0, UIKit.GREEN)
 			draw_polyline(PackedVector2Array([o + Vector2(14, 20), o + Vector2(19, 25), o + Vector2(27, 14)]), Color.BLACK, 3.0, true)
+
+
+# ================================================================== pemanasan huruf (di luar layar)
+## Huruf berkontur (outline) baru dibuat Godot saat PERTAMA kali digambar -> patah-patah ketika tab / kartu baru muncul.
+## Node kecil ini menggambar semua huruf yang dipakai layar ini sekali, di luar layar, beberapa ukuran per frame,
+## lalu menghapus dirinya sendiri. Tidak terlihat dan tidak mengubah tampilan apa pun.
+class GlyphWarm extends Control:
+	const COMBOS := [[44, 8], [32, 6], [38, 7], [34, 7], [28, 4], [24, 5], [22, 5], [22, 3], [22, 0], [20, 3], [20, 0], [23, 0],
+		[18, 4], [17, 4], [16, 4], [16, 3], [15, 3], [15, 4], [15, 0], [26, 6], [30, 6], [36, 6], [40, 8]]
+	const CH_UP := "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -/,.!%+:'&"
+	const CH_LOW := "abcdefghijklmnopqrstuvwxyz"
+	const PER_FRAME := 1          # dulu 3: tiap kombinasi ukuran/kontur = ratusan huruf yang dirender, jadi dibagi lebih halus
+	var _i: int = 0
+	var _skip: int = 0
+
+	func _init() -> void:
+		mouse_filter = Control.MOUSE_FILTER_IGNORE
+		position = Vector2(-6000.0, -6000.0)
+		size = Vector2(1000.0, 100.0)
+
+	func _process(d: float) -> void:
+		if not CosmeticUI._mw_glyph_go:
+			return                    # tunggu pemuatan tekstur selesai dulu
+		if d > CosmeticUI.MW_MAX_FRAME and _skip < CosmeticUI.MW_MAX_SKIP:
+			_skip += 1
+			return
+		_skip = 0
+		_i += 1                       # _process berjalan sebelum _draw: potongan yang digambar frame ini = _i - 1
+		if (_i - 1) * PER_FRAME >= COMBOS.size():
+			CosmeticUI._mw_state = 2
+			queue_free()
+		else:
+			queue_redraw()
+
+	func _exit_tree() -> void:
+		if CosmeticUI._mw_state == 1:
+			CosmeticUI._mw_state = 2   # pemain meninggalkan menu sebelum selesai: jangan menahan pekerjaan lain
+
+	func _draw() -> void:
+		if _i == 0:
+			return                    # gambar pertama otomatis saat masuk tree: jangan render huruf di frame itu
+		var f: Font = UIKit.font()
+		for k in PER_FRAME:
+			var idx: int = (_i - 1) * PER_FRAME + k
+			if idx >= COMBOS.size():
+				break
+			var fs: int = int(COMBOS[idx][0])
+			var ol: int = int(COMBOS[idx][1])
+			var txt: String = CH_UP + (CH_LOW if fs <= 20 else "")
+			if ol > 0:
+				draw_string_outline(f, Vector2(0.0, 60.0), txt, HORIZONTAL_ALIGNMENT_LEFT, -1, fs, ol, Color.BLACK)
+			draw_string(f, Vector2(0.0, 60.0), txt, HORIZONTAL_ALIGNMENT_LEFT, -1, fs, Color.WHITE)
 
 
 # ================================================================== lapisan dialog (di atas semua anak lain)
@@ -1883,6 +2213,7 @@ class DockButton extends Control:
 
 	func _ready() -> void:
 		mouse_entered.connect(func() -> void: hovered.emit())
+		CosmeticUI.menu_warm_begin(self)        # menu = waktu santai: siapkan Shop & Inventory di latar belakang
 
 	func _gui_input(event: InputEvent) -> void:
 		if event is InputEventMouseButton and event.pressed and event.button_index == MOUSE_BUTTON_LEFT:
@@ -1897,6 +2228,7 @@ class DockButton extends Control:
 		activated.emit()
 
 	func _process(d: float) -> void:
+		CosmeticUI.menu_warm_tick(d)
 		t += d
 		sel = lerpf(sel, 1.0 if selected else 0.0, minf(1.0, d * 12.0))
 		flash = maxf(flash - d * 3.0, 0.0)

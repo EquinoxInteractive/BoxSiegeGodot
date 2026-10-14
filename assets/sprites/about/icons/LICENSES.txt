@@ -1,0 +1,13 @@
+Icon sources used by the ABOUT US > INFO > CONTACT screen
+=========================================================
+
+github.svg, instagram.svg, x.svg
+  Simple Icons (https://simpleicons.org) - CC0 1.0 Universal (public domain dedication).
+  The logos themselves are trademarks of their respective owners (GitHub, Inc. / Meta Platforms, Inc. / X Corp.)
+  and are used here only to link to the developer's official profiles.
+
+globe.svg
+  Lucide (https://lucide.dev) - ISC License
+  Copyright (c) 2026 Lucide Icons and Contributors
+  Permission to use, copy, modify, and/or distribute this software for any purpose with or without fee is hereby
+  granted, provided that the above copyright notice and this permission notice appear in all copies.

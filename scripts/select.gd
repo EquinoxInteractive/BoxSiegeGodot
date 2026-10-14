@@ -2,7 +2,8 @@ extends Control
 ## Layar "CHOOSE YOUR FIGHTER" bergaya game fighting PlayStation.
 ##  - Grid roster di tengah berisi SEMUA karakter (bisa dipakai pemain mana saja).
 ##  - Tiap pemain punya KURSOR sendiri (warna pemain) + panel potret besar di kiri / kanan.
-##  - Karakter yang sudah DIKUNCI satu pemain tidak bisa dikunci pemain lain (kotaknya diredupkan + lencana pemilik).
+##  - Satu karakter punya banyak VARIAN (tampilan asli + tiap skin yang dimiliki). Pemain lain boleh memakai karakter yang sama
+##    selama kombinasi karakter + skin-nya berbeda. Karakter baru diredupkan + "TAKEN" kalau semua variannya sudah terpakai.
 ##  - Alur tiap pemain: pilih fighter -> kunci (tombol tembak / accept) -> pilih senjata -> READY.
 ##  - Semua READY -> hitung mundur 3-2-1 -> (3-4 pemain: layar TEAM) -> layar BATTLE SETTINGS (map, waktu, power up, dll).
 ##  - Boleh dipakai bersamaan oleh semua controller / keyboard layout yang terhubung.
@@ -41,10 +42,13 @@ class SelState extends RefCounted:
 	var weapon: Array[int] = [0, 0, 0, 0]            # indeks Global.WEAPON_ORDER
 	var locked: Array[int] = [-1, -1, -1, -1]        # karakter yang sudah dikunci (-1 = belum)
 	var rolling: Array[bool] = [false, false, false, false]
-	# ---- skin (Shop/Inventory): sk 0 = biasa, 1 = sedang memilih SKIN KARAKTER, 2 = sedang memilih SKIN SENJATA
+	var back_focus: Array[bool] = [false, false, false, false]   # kursor pemain ini sedang di tombol BACK (kiri bawah)
+	# ---- skin (Shop/Inventory): sk 0 = biasa, 1 = SKIN KARAKTER, 2 = SKIN SENJATA UTAMA, 3 = SKIN PISTOL, 4 = SKIN PISAU
 	var sk: Array[int] = [0, 0, 0, 0]
 	var cskin: Array[String] = ["", "", "", ""]
 	var wskin: Array[String] = ["", "", "", ""]
+	var pskin: Array[String] = ["", "", "", ""]      # skin pistol (senjata cadangan saat peluru habis)
+	var kskin: Array[String] = ["", "", "", ""]      # skin pisau
 
 	func _init(count: int = 2) -> void:
 		n = count
@@ -57,11 +61,41 @@ class SelState extends RefCounted:
 			RosterGrid.cell_at(0, last_row), RosterGrid.cell_at(last_col, last_row),
 		]
 
-	## Pemain yang sudah mengunci karakter ini (selain `except`); -1 kalau bebas.
-	func owner_of(ch: int, except: int = -1) -> int:
+	## Pemain lain (selain `except`) yang sudah mengunci karakter ini, apa pun skin-nya.
+	func holders_of(ch: int, except: int = -1) -> Array[int]:
+		var out: Array[int] = []
 		for i in n:
 			if i != except and locked[i] == ch:
+				out.append(i)
+		return out
+
+	## Semua VARIAN sebuah karakter: tampilan asli ("") + setiap skin yang dimiliki.
+	## Satu karakter dengan 1 skin = 2 varian, jadi bisa dipakai 2 pemain sekaligus (skin harus berbeda).
+	func variants_of(ch: int) -> Array:
+		return [""] + Cosmetics.owned_skin_ids(ch)
+
+	## Pemain lain yang sudah memakai kombinasi (karakter + skin) ini; -1 kalau varian itu masih bebas.
+	func skin_owner(ch: int, sid: String, except: int = -1) -> int:
+		for i in n:
+			if i != except and locked[i] == ch and cskin[i] == sid:
 				return i
+		return -1
+
+	## Varian pertama (urutan: asli dulu, lalu skin) yang belum dipakai pemain lain; "" kalau semua terpakai.
+	func first_free_skin(ch: int, except: int = -1) -> String:
+		for sid in variants_of(ch):
+			if skin_owner(ch, String(sid), except) < 0:
+				return String(sid)
+		return ""
+
+	## Pemain yang membuat karakter ini TIDAK BISA dipilih `except`; -1 kalau masih ada varian bebas.
+	## Karakter baru dianggap "TAKEN" kalau SEMUA variannya (asli + semua skin yang dimiliki) sudah terpakai.
+	func owner_of(ch: int, except: int = -1) -> int:
+		var h: Array[int] = holders_of(ch, except)
+		if h.is_empty():
+			return -1
+		if h.size() >= variants_of(ch).size():
+			return h[0]
 		return -1
 
 	func all_ready() -> bool:
@@ -222,6 +256,13 @@ class RosterGrid extends Control:
 				UIKit.text_in(self, "P%d" % (owner + 1), br, 14, Color.WHITE, HORIZONTAL_ALIGNMENT_CENTER, 3)
 			else:
 				draw_rect(r, Color(1, 1, 1, 0.28), false, 2.0)
+				# karakter ini sudah dipakai pemain lain tapi masih ada skin yang bebas: lencana kecil per pemain
+				var hs: Array[int] = st.holders_of(i)
+				for hk in hs.size():
+					var hc: Color = Global.PLAYER_COLORS[hs[hk]]
+					var hb := Rect2(r.end.x - 21.0 * float(hk + 1) - 2.0, r.end.y - 18.0, 20.0, 15.0)
+					draw_colored_polygon(UIKit.slanted(hb.size.x, hb.size.y, 4, hb.position.x, hb.position.y), hc.darkened(0.15))
+					UIKit.text_in(self, "P%d" % (hs[hk] + 1), hb, 11, Color.WHITE, HORIZONTAL_ALIGNMENT_CENTER, 2)
 
 		# ----- sel RANDOM
 		var rr: Rect2 = cell_rect(RANDOM_CELL)
@@ -236,6 +277,8 @@ class RosterGrid extends Control:
 		# ----- kursor tiap pemain
 		var pulse: float = 0.5 + 0.5 * sin(t * 8.0)
 		for i in st.n:
+			if st.back_focus[i]:
+				continue            # kursor pemain ini sedang di tombol BACK
 			var col: Color = Global.PLAYER_COLORS[i]
 			var locked: bool = st.stage[i] >= 1
 			var cr: Rect2 = crect[i].grow(2.0 + bump[i] * 5.0)
@@ -264,7 +307,9 @@ class RosterGrid extends Control:
 			draw_colored_polygon(tpts, col)
 			draw_polyline(UIKit.closed(tpts), Color.WHITE, 1.5, true)
 			UIKit.text_in(self, "P%d" % (i + 1), Rect2(tp, Vector2(tw, th)), 15, Color.WHITE, HORIZONTAL_ALIGNMENT_CENTER, 3)
-			if locked:
+			# Gembok hanya untuk karakter TANPA skin lain (benar-benar eksklusif). Karakter yang punya skin masih bisa
+			# dipakai pemain lain dengan skin berbeda, jadi gemboknya disembunyikan.
+			if locked and st.locked[i] >= 0 and st.variants_of(int(st.locked[i])).size() <= 1:
 				UIKit.draw_lock(self, cr.get_center(), 22.0, Color(1, 1, 1, 0.95))
 
 
@@ -450,6 +495,10 @@ class FighterPanel extends Control:
 				stext = "SELECT SKIN"
 			elif st.sk[idx] == 2:
 				stext = "GUN SKIN"
+			elif st.sk[idx] == 3:
+				stext = "PISTOL SKIN"
+			elif st.sk[idx] == 4:
+				stext = "KNIFE SKIN"
 		elif stage >= 2:
 			stext = "READY!"
 			scol = UIKit.GREEN
@@ -503,7 +552,7 @@ class FighterPanel extends Control:
 			var tex: Texture2D = Cosmetics.char_tex(ch, st.cskin[idx] if show_cos else "")
 			draw_rect(Rect2(-ps * 0.5 - 4, -ps * 0.5 - 4, ps + 8, ps + 8), Color(0, 0, 0, 0.75 * al))
 			var tint: Color = Color(1, 1, 1, al) if not taken else Color(0.45, 0.35, 0.35, al)
-			var plo: Dictionary = Cosmetics.loadout(ch, st.cskin[idx]) if show_cos else {}
+			var plo: Dictionary = Cosmetics.loadout(ch, st.cskin[idx], idx) if show_cos else {}
 			Cosmetics.draw_accessories(self, ch, plo, Rect2(-ps * 0.5, -ps * 0.5, ps, ps), tint, 0)
 			draw_texture_rect(tex, Rect2(-ps * 0.5, -ps * 0.5, ps, ps), false, tint)
 			Cosmetics.draw_accessories(self, ch, plo, Rect2(-ps * 0.5, -ps * 0.5, ps, ps), tint, 1)
@@ -558,6 +607,8 @@ class FighterPanel extends Control:
 		# ----- senjata
 		if stage == 1 and st.sk[idx] == 1:
 			_draw_skin_plate(_plate_rect())
+		elif stage == 1 and st.sk[idx] >= 3:
+			_draw_extra_skin_plate(_plate_rect(), "pistol" if st.sk[idx] == 3 else "knife")
 		else:
 			_draw_weapon_plate(_plate_rect(), stage)
 
@@ -588,10 +639,23 @@ class FighterPanel extends Control:
 			nm = String(info[1])
 			rc = Cosmetics.rarity_color(String(info[2]))
 			rn = String(Cosmetics.RARITY_NAMES[String(info[2])])
-		UIKit.text_in(self, "CHARACTER SKIN", Rect2(pl.position.x, pl.position.y + 6, pl.size.x, 18), 14, Color(1, 1, 1, 0.65), HORIZONTAL_ALIGNMENT_CENTER, 3)
-		var nr := Rect2(pl.position.x + 28, pl.position.y + pl.size.y * 0.5 - 30, pl.size.x - 56, 40)
-		UIKit.text_in(self, nm, nr, _fit_font(nm, nr.size.x, 32), Color.WHITE, HORIZONTAL_ALIGNMENT_CENTER, 7)
-		UIKit.text_in(self, rn, Rect2(pl.position.x, nr.end.y - 8, pl.size.x, 20), 15, rc, HORIZONTAL_ALIGNMENT_CENTER, 4)
+		# Tata letak bertingkat (judul -> nama skin -> rarity) supaya tidak saling menimpa. Panel pendek (1 pemain, tinggi 78)
+		# memakai baris yang lebih rapat dan nama yang lebih kecil; panel tinggi (2 pemain per sisi) tetap longgar.
+		var tall: bool = pl.size.y >= 120.0
+		UIKit.text_in(self, "CHARACTER SKIN", Rect2(pl.position.x, pl.position.y + 5, pl.size.x, 16), 13 if not tall else 14, Color(1, 1, 1, 0.65), HORIZONTAL_ALIGNMENT_CENTER, 3)
+		var nr: Rect2
+		var rar_r: Rect2
+		var nfs2: int
+		if tall:
+			nr = Rect2(pl.position.x + 28, pl.position.y + pl.size.y * 0.5 - 30, pl.size.x - 56, 40)
+			nfs2 = _fit_font(nm, nr.size.x, 32)
+			rar_r = Rect2(pl.position.x, nr.end.y - 8, pl.size.x, 20)
+		else:
+			nr = Rect2(pl.position.x + 28, pl.position.y + 23, pl.size.x - 56, 28)
+			nfs2 = _fit_font(nm, nr.size.x, 26)
+			rar_r = Rect2(pl.position.x, nr.end.y - 1, pl.size.x, 16)
+		UIKit.text_in(self, nm, nr, nfs2, Color.WHITE, HORIZONTAL_ALIGNMENT_CENTER, 7 if tall else 5)
+		UIKit.text_in(self, rn, rar_r, 15 if tall else 14, rc, HORIZONTAL_ALIGNMENT_CENTER, 4)
 		# titik indikator
 		var idxo: int = maxi(opts.find(cur), 0)
 		var dots: int = opts.size()
@@ -599,7 +663,65 @@ class FighterPanel extends Control:
 		var dx0: float = pl.position.x + pl.size.x * 0.5 - dw * float(dots - 1) * 0.5
 		for k in dots:
 			var dc: Color = Color(UIKit.GOLD, 1.0) if k == idxo else Color(1, 1, 1, 0.25)
+			var dot_owner: int = st.skin_owner(ch, String(opts[k]), idx)
+			if dot_owner >= 0:
+				dc = Color(Global.PLAYER_COLORS[dot_owner], 0.85)      # varian ini sedang dipakai pemain lain
 			draw_circle(Vector2(dx0 + dw * float(k), pl.end.y - 8), 3.5 if k == idxo else 2.5, dc)
+
+	## Panel pemilih SKIN PISTOL / SKIN PISAU (muncul setelah skin senjata utama; dilewati kalau tidak punya skin).
+	func _draw_extra_skin_plate(pl: Rect2, which: String) -> void:
+		var focus: float = 0.5 + 0.5 * sin(t * 5.0)
+		var ppts := UIKit.slanted(pl.size.x, pl.size.y, 10, pl.position.x, pl.position.y)
+		draw_colored_polygon(ppts, Color(0, 0, 0, 0.5))
+		draw_polyline(UIKit.closed(ppts), UIKit.GOLD, 3.0, true)
+		var opts: Array = [""] + Cosmetics.owned_wskin_ids(which)
+		var cur: String = st.pskin[idx] if which == "pistol" else st.kskin[idx]
+		var wc: Color = Color(UIKit.GOLD, 1.0)
+		var wpul: float = 1.0 + focus * 0.25
+		var wide: bool = pl.size.x > pl.size.y * 2.2
+		var cy: float = pl.position.y + pl.size.y * 0.5
+		UIKit.draw_chevron(self, Vector2(pl.position.x + 20 - maxf(-nudge, 0) * 4.0, cy), 9.0 * wpul, -1, wc)
+		UIKit.draw_chevron(self, Vector2(pl.end.x - 20 + maxf(nudge, 0) * 4.0, cy), 9.0 * wpul, 1, wc)
+		_hit["wp_l"] = {"rect": Rect2(pl.position.x, pl.position.y, pl.size.x * 0.22, pl.size.y), "dir": -1}
+		_hit["wp_r"] = {"rect": Rect2(pl.end.x - pl.size.x * 0.22, pl.position.y, pl.size.x * 0.22, pl.size.y), "dir": 1}
+		var nm: String = "DEFAULT"
+		var rc: Color = Color(1, 1, 1, 0.7)
+		var rn: String = "ORIGINAL"
+		if cur != "":
+			var info: Array = Cosmetics.weapon_skin_info(which, cur)
+			if not info.is_empty():
+				nm = String(info[1])
+				rc = Cosmetics.rarity_color(String(info[2]))
+				rn = String(Cosmetics.RARITY_NAMES[String(info[2])])
+		var title: String = "PISTOL SKIN" if which == "pistol" else "KNIFE SKIN"
+		UIKit.text_in(self, title, Rect2(pl.position.x, pl.position.y + 5, pl.size.x, 16), 13, Color(1, 1, 1, 0.65), HORIZONTAL_ALIGNMENT_CENTER, 3)
+		var gtex: Texture2D = Cosmetics.weapon_tex(which, cur, idx)
+		var gun_box: Rect2
+		var name_rect: Rect2
+		var rar_rect: Rect2
+		if wide:
+			gun_box = Rect2(pl.position.x + 40, pl.position.y + 22, pl.size.x * 0.34, pl.size.y - 36)
+			var tx: float = gun_box.end.x + 10.0
+			name_rect = Rect2(tx, pl.position.y + 24, pl.end.x - 36.0 - tx, 28)
+			rar_rect = Rect2(tx, pl.position.y + 50, pl.end.x - 36.0 - tx, 16)
+		else:
+			gun_box = Rect2(pl.position.x + 34, pl.position.y + 24, pl.size.x - 68, pl.size.y * 0.36)
+			name_rect = Rect2(pl.position.x + 28, gun_box.end.y + 6, pl.size.x - 56, 30)
+			rar_rect = Rect2(pl.position.x, name_rect.end.y, pl.size.x, 18)
+		var gr: Rect2 = _fit(gtex, gun_box)
+		draw_set_transform(Vector2(shake, 0) + gr.get_center(), deg_to_rad(sin(t * 2.0) * 2.0), Vector2.ONE * wpop)
+		draw_texture_rect(gtex, Rect2(-gr.size * 0.5, gr.size), false)
+		draw_set_transform(Vector2(shake, 0))
+		UIKit.text_in(self, nm, name_rect, _fit_font(nm, name_rect.size.x, 24), Color.WHITE, HORIZONTAL_ALIGNMENT_CENTER, 5)
+		UIKit.text_in(self, rn, rar_rect, 14, rc, HORIZONTAL_ALIGNMENT_CENTER, 4)
+		# titik indikator
+		var idxo: int = maxi(opts.find(cur), 0)
+		var dots: int = opts.size()
+		var dw: float = minf(18.0, (pl.size.x - 80.0) / float(maxi(dots, 1)))
+		var dx0: float = pl.position.x + pl.size.x * 0.5 - dw * float(dots - 1) * 0.5
+		for k in dots:
+			var dc: Color = Color(UIKit.GOLD, 1.0) if k == idxo else Color(1, 1, 1, 0.25)
+			draw_circle(Vector2(dx0 + dw * float(k), pl.end.y - 7), 3.5 if k == idxo else 2.5, dc)
 
 	func _draw_weapon_plate(pl: Rect2, stage: int) -> void:
 		var active: bool = stage == 1
@@ -835,6 +957,8 @@ func _ready() -> void:
 	back_btn.position = Vector2(10, 656)
 	back_btn.accent = Color("ff7a7a")
 	back_btn.activated.connect(_on_back)
+	back_btn.auto_hover = true          # efek hover mouse: geser + menyala + kilau + kursor tangan
+	back_btn.idle_alpha = 0.85
 	back_btn.modulate.a = 0.85
 	add_child(back_btn)
 
@@ -948,6 +1072,10 @@ func _nav(slot: int, dx: int, dy: int) -> void:
 					_cycle_cskin(slot, dx)
 				elif st.sk[slot] == 2:
 					_cycle_wskin(slot, dx)
+				elif st.sk[slot] == 3:
+					_cycle_extra(slot, dx, "pistol")
+				elif st.sk[slot] == 4:
+					_cycle_extra(slot, dx, "knife")
 				else:
 					st.weapon[slot] = posmod(st.weapon[slot] + dx, Global.WEAPON_ORDER.size())
 					st.wskin[slot] = ""
@@ -965,10 +1093,19 @@ func _wskin_opts(slot: int) -> Array:
 
 func _cycle_cskin(slot: int, dir: int) -> void:
 	var opts: Array = _cskin_opts(slot)
+	var ch: int = int(st.locked[slot])
 	var i: int = maxi(opts.find(st.cskin[slot]), 0)
-	st.cskin[slot] = String(opts[posmod(i + dir, opts.size())])
-	panels[slot].weapon_fx(dir)
-	Global.play_sfx("ui_move", -10.0)
+	# Lewati varian yang sudah dipakai pemain lain pada karakter yang sama: tiap (karakter + skin) harus unik.
+	for k in range(1, opts.size()):
+		var cand: String = String(opts[posmod(i + dir * k, opts.size())])
+		if st.skin_owner(ch, cand, slot) < 0:
+			st.cskin[slot] = cand
+			panels[slot].weapon_fx(dir)
+			Global.play_sfx("ui_move", -10.0)
+			return
+	# tidak ada varian lain yang bebas: tetap di skin sekarang
+	panels[slot].deny()
+	Global.play_sfx("ui_error", -12.0)
 
 
 func _cycle_wskin(slot: int, dir: int) -> void:
@@ -979,22 +1116,87 @@ func _cycle_wskin(slot: int, dir: int) -> void:
 	Global.play_sfx("ui_move", -10.0)
 
 
+## Pilihan skin pistol / pisau yang dimiliki ("" = tampilan asli).
+func _extra_opts(_slot: int, which: String) -> Array:
+	return [""] + Cosmetics.owned_wskin_ids(which)
+
+
+func _cycle_extra(slot: int, dir: int, which: String) -> void:
+	var opts: Array = _extra_opts(slot, which)
+	var cur: String = st.pskin[slot] if which == "pistol" else st.kskin[slot]
+	var i: int = maxi(opts.find(cur), 0)
+	var nxt: String = String(opts[posmod(i + dir, opts.size())])
+	if which == "pistol":
+		st.pskin[slot] = nxt
+	else:
+		st.kskin[slot] = nxt
+	panels[slot].weapon_fx(dir)
+	Global.play_sfx("ui_move", -10.0)
+
+
+## Apakah tahap skin `k` (2 = senjata utama, 3 = pistol, 4 = pisau) punya pilihan untuk pemain ini.
+func _skin_stage_has(slot: int, k: int) -> bool:
+	match k:
+		2: return _wskin_opts(slot).size() > 1
+		3:
+			# pistol hanya dipakai senjata yang punya cadangan pistol (SCREAM); senjata lain langsung lanjut ke skin pisau
+			var wid: String = String(Global.WEAPON_ORDER[st.weapon[slot]])
+			if String(Global.WEAPONS[wid].get("fallback", "")) != "pistol":
+				return false
+			return _extra_opts(slot, "pistol").size() > 1
+		4: return _extra_opts(slot, "knife").size() > 1
+	return false
+
+
+## Tahap skin berikutnya yang punya pilihan (urutan: senjata utama -> pistol -> pisau); 0 = tidak ada lagi (langsung READY).
+func _next_skin_stage(slot: int) -> int:
+	for k in range(maxi(st.sk[slot], 1) + 1, 5):
+		if _skin_stage_has(slot, k):
+			return k
+	return 0
+
+
+## Tahap skin sebelumnya yang punya pilihan; 0 = kembali ke pilih senjata.
+func _prev_skin_stage(slot: int) -> int:
+	for k in range(st.sk[slot] - 1, 1, -1):
+		if _skin_stage_has(slot, k):
+			return k
+	return 0
+
+
 ## Setelah karakter dikunci: kalau punya skin -> pilih skin dulu (selalu mulai dari DEFAULT), kalau tidak langsung ke senjata (bypass).
 func _enter_after_lock(slot: int) -> void:
 	st.stage[slot] = 1
 	st.wskin[slot] = ""
+	st.pskin[slot] = ""
+	st.kskin[slot] = ""
+	var ch: int = int(st.locked[slot])
+	# Mulai dari DEFAULT; kalau DEFAULT sudah dipakai pemain lain pada karakter yang sama, mulai dari skin bebas pertama.
+	st.cskin[slot] = st.first_free_skin(ch, slot)
 	if _cskin_opts(slot).size() > 1:
 		st.sk[slot] = 1
-		st.cskin[slot] = ""          # selalu mulai dari DEFAULT; skin dipilih manual oleh pemain
+		var others: Array[int] = st.holders_of(ch, slot)
+		if not others.is_empty():
+			var who: String = ""
+			for o in others:
+				who += ("" if who == "" else ", ") + "P%d" % (o + 1)
+			UIInput.toast("SAME FIGHTER", "%s also uses %s - your skin must be different" % [who, Global.character_name(0, ch)], UIKit.GOLD)
 	else:
 		st.sk[slot] = 0
-		st.cskin[slot] = ""
 
 
 func _move_cursor(slot: int, dx: int, dy: int) -> void:
+	if st.back_focus[slot]:
+		# kursor ada di tombol BACK: ATAS / KANAN = balik ke sel RANDOM
+		if dy < 0 or dx > 0:
+			_set_back_focus(slot, false)
+		return
 	var c: int = st.cursor[slot]
 	var nc: int = c
 	if c == RANDOM_CELL:
+		if dy > 0 or dx < 0:
+			_set_back_focus(slot, true)      # dari RANDOM: BAWAH / KIRI = tombol BACK
+			return
 		if dy != 0:
 			nc = RosterGrid.cell_at(roster_col(slot), RosterGrid.ROWS - 1 if dy < 0 else 0)
 	else:
@@ -1015,11 +1217,36 @@ func _move_cursor(slot: int, dx: int, dy: int) -> void:
 
 var _last_col: Array[int] = [0, 0, 0, 0]
 
+
+## Pindahkan kursor pemain ke tombol BACK (on) atau kembalikan ke sel RANDOM (off).
+func _set_back_focus(slot: int, on: bool) -> void:
+	if st.back_focus[slot] == on:
+		return
+	st.back_focus[slot] = on
+	roster.punch(slot)
+	Global.play_sfx("ui_hover", -9.0)
+
+
+## Tombol BACK menyala selama ada pemain yang kursornya di situ; tag-nya menampilkan siapa (P1, P2, ...).
+func _sync_back_btn() -> void:
+	if back_btn == null or st == null:
+		return
+	var who: String = ""
+	for i in n:
+		if st.back_focus[i]:
+			who += ("" if who == "" else " ") + "P%d" % (i + 1)
+	if back_btn.tag != who:
+		back_btn.tag = who
+		back_btn.queue_redraw()
+	back_btn.set_selected(who != "")
+
 func roster_col(slot: int) -> int:
 	return _last_col[slot]
 
 
 func _step_cursor(slot: int, dir: int) -> void:
+	if st.back_focus[slot]:
+		st.back_focus[slot] = false
 	if st.stage[slot] == 1 and st.sk[slot] != 0 and not countdown_on:
 		_nav(slot, dir, 0)     # tombol bahu juga bisa ganti skin
 		return
@@ -1043,6 +1270,10 @@ func _confirm(slot: int) -> void:
 		return
 	match st.stage[slot]:
 		0:
+			if st.back_focus[slot]:
+				Global.play_sfx("ui_back", -7.0)
+				_on_back()
+				return
 			var c: int = st.cursor[slot]
 			if c == RANDOM_CELL:
 				_roll(slot)
@@ -1064,23 +1295,26 @@ func _confirm(slot: int) -> void:
 				Global.play_sfx("ui_confirm", -8.0)
 				return
 			var wid: String = Global.WEAPON_ORDER[st.weapon[slot]]
-			if not bool(Global.WEAPONS[wid]["enabled"]):
-				panels[slot].deny()
-				UIInput.toast("WEAPON COMING SOON", "Pick another weapon", Color("ff7a7a"))
-				return
-			if st.sk[slot] == 0 and _wskin_opts(slot).size() > 1:
-				# senjata punya skin yang dimiliki -> pilih skin senjata dulu sebelum READY
-				st.sk[slot] = 2
-				st.wskin[slot] = Cosmetics.last_wskin(wid)
+			if st.sk[slot] == 0:
+				if not bool(Global.WEAPONS[wid]["enabled"]):
+					panels[slot].deny()
+					UIInput.toast("WEAPON COMING SOON", "Pick another weapon", Color("ff7a7a"))
+					return
+				# senjata baru dipilih: semua skin senjata selalu mulai dari NORMAL, skin dipilih manual oleh pemain
+				st.wskin[slot] = ""
+				st.pskin[slot] = ""
+				st.kskin[slot] = ""
+				Global.play_weapon_voice(wid)     # suara nama senjata langsung berbunyi saat senjata dipilih (assets/sfx/voice/weapon_<id>.*)
+			# lanjut ke tahap skin berikutnya yang punya pilihan: senjata utama -> pistol -> pisau (yang tidak punya skin dilewati)
+			var nxt: int = _next_skin_stage(slot)
+			if nxt > 0:
+				st.sk[slot] = nxt
 				panels[slot].weapon_fx(1)
 				Global.play_sfx("ui_confirm", -8.0)
 				return
-			if st.sk[slot] == 2:
-				Cosmetics.set_last_wskin(wid, st.wskin[slot])
-				st.sk[slot] = 0
+			st.sk[slot] = 0
 			st.stage[slot] = 2
 			panels[slot].ready_fx(true)
-			Global.play_weapon_voice(wid)         # suara nama senjata saat dipilih (assets/sfx/voice/weapon_<id>.*)
 			_check_countdown()
 
 
@@ -1098,8 +1332,8 @@ func _back(slot: int) -> void:
 			st.sk[slot] = 0
 			panels[slot].ready_fx(false)
 		1:
-			if st.sk[slot] == 2:
-				st.sk[slot] = 0           # kembali ke pilih senjata
+			if st.sk[slot] >= 2:
+				st.sk[slot] = _prev_skin_stage(slot)    # kembali ke tahap skin sebelumnya, atau ke pilih senjata
 				Global.play_sfx("ui_back", -7.0)
 				return
 			if st.sk[slot] == 0 and _cskin_opts(slot).size() > 1:
@@ -1114,12 +1348,15 @@ func _back(slot: int) -> void:
 		0:
 			if slot == 0:
 				_on_back()
+			elif st.back_focus[slot]:
+				_set_back_focus(slot, false)     # pemain lain: batal dari tombol BACK, balik ke roster
 
 
 ## Acak karakter yang masih bebas dengan efek "roulette", lalu langsung dikunci.
 func _roll(slot: int) -> void:
 	if st.rolling[slot] or st.stage[slot] != 0:
 		return
+	st.back_focus[slot] = false
 	st.rolling[slot] = true
 	var steps := 13
 	for k in steps:
@@ -1164,6 +1401,7 @@ func _check_countdown() -> void:
 
 
 func _process(delta: float) -> void:
+	_sync_back_btn()
 	if countdown_on and not leaving:
 		cd_time -= delta
 		var v: int = int(ceil(cd_time))
@@ -1180,6 +1418,7 @@ func _on_cell_clicked(cell: int) -> void:
 		return
 	if st.stage[0] != 0:
 		return
+	st.back_focus[0] = false
 	if st.cursor[0] == cell:
 		_confirm(0)
 	else:
@@ -1201,6 +1440,8 @@ func _update_prompts() -> void:
 		return
 	if countdown_on:
 		prompt.set_prompts([[&"none", "CONFIRM = SKIP"], [&"back", "CANCEL"]])
+	elif n == 1 and st != null and st.back_focus[0] and st.stage[0] == 0:
+		prompt.set_prompts([[&"dpad", "MOVE"], [&"none", "SHOOT / ACCEPT = BACK"], [&"back", "BACK"]])
 	else:
 		prompt.set_prompts([
 			[&"dpad", "MOVE"], [&"none", "SHOOT / ACCEPT = LOCK IN"],
@@ -1227,11 +1468,15 @@ func _proceed() -> void:
 	Global.selections = []
 	for i in n:
 		Global.selections.append({"character": st.locked[i], "weapon": Global.WEAPON_ORDER[st.weapon[i]],
-			"skin": st.cskin[i], "wskin": st.wskin[i]})
+			"skin": st.cskin[i], "wskin": st.wskin[i], "pskin": st.pskin[i], "kskin": st.kskin[i]})
 		Cosmetics.set_last_cskin(int(st.locked[i]), st.cskin[i])
+		# ingat juga skin senjata terakhir (utama, pistol, pisau) sebagai cadangan untuk Campaign
 		Cosmetics.set_last_wskin(String(Global.WEAPON_ORDER[st.weapon[i]]), st.wskin[i])
+		if String(Global.WEAPONS[String(Global.WEAPON_ORDER[st.weapon[i]])].get("fallback", "")) == "pistol":
+			Cosmetics.set_last_wskin("pistol", st.pskin[i])
+		Cosmetics.set_last_wskin("knife", st.kskin[i])
 	if Global.campaign_mode and n == 1:
-		CampaignData.save_fighter(int(st.locked[0]), String(Global.WEAPON_ORDER[st.weapon[0]]))   # ingat pilihan untuk masuk berikutnya
+		CampaignData.save_fighter(int(st.locked[0]), String(Global.WEAPON_ORDER[st.weapon[0]]), Global.selections[0])   # ingat pilihan (termasuk semua skin) untuk masuk berikutnya
 	Global.assign_devices()
 	Global.play_sfx("count_go", -6.0)
 	for p in panels:
