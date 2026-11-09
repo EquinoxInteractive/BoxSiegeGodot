@@ -2,7 +2,9 @@
 import os, sys, random
 from PIL import Image, ImageDraw
 from artlib import *
-import skins, weaponskins, accessories
+import skins, weaponskins, accessories, skins_fx, accessories_fx
+WEAPONS_ONLY = os.environ.get('WEAPONS_ONLY') == '1'   # WEAPONS_ONLY=1: lewati skin karakter & aksesoris, hanya skin senjata + katalog
+NEW_ONLY = os.environ.get('NEW_ONLY') == '1'   # NEW_ONLY=1: hanya buat aset premium baru (skin LV, senjata LV, aksesoris animasi)
 
 ROOT = os.path.abspath("..")
 CHARS = [("p1","angry"),("p1","melow"),("p1","bandel"),("p1","ninja"),("p2","calm"),("p2","baik"),("p2","silat"),("p2","mime"),
@@ -15,19 +17,24 @@ WPRICE = {"common":250,"rare":600,"epic":1200,"legendary":2400}
 def mk(p): os.makedirs(p, exist_ok=True)
 
 # ---- skin karakter
-for ci,(folder,name) in enumerate(CHARS):
+for ci,(folder,name) in enumerate([] if WEAPONS_ONLY else CHARS):
     d = f"{ROOT}/assets/sprites/skins/{name}"; mk(d)
-    for ti,(tid,tn,ra,fn) in enumerate(skins.THEMES):
+    for ti,(tid,tn,ra,fn) in enumerate([] if NEW_ONLY else skins.THEMES):
         seed = 7000 + ci*101 + ti*13
         for suf in ("", "_die"):
             src = f"{ROOT}/assets/sprites/characters/{folder}/{name}{suf}.png"
             im = skins.make_skin(src, ti, seed)
             im.save(f"{d}/{tid}{suf}.png", optimize=True)
+    for ti,(tid,tn,ra,fn,p1,p2,p3) in enumerate(skins_fx.THEMES_FX):
+        seed = 91000 + ci*131 + ti*17
+        for suf in ("", "_die"):
+            src = f"{ROOT}/assets/sprites/characters/{folder}/{name}{suf}.png"
+            skins_fx.make_skin_fx(src, ti, seed).save(f"{d}/{tid}{suf}.png", optimize=True)
     print("skin", name, flush=True)
 
 # ---- aksesoris
 mk(f"{ROOT}/assets/sprites/accessories")
-for (aid,nm,slot,pr,ra,layer,fn) in accessories.ACCESSORIES:
+for (aid,nm,slot,pr,ra,layer,fn) in [] if WEAPONS_ONLY else (([] if NEW_ONLY else accessories.ACCESSORIES) + accessories_fx.ACCESSORIES_FX):
     fn().save(f"{ROOT}/assets/sprites/accessories/{aid}.png", optimize=True)
 
 # ---- skin senjata
@@ -42,7 +49,15 @@ for wid, lst in weaponskins.SKINS.items():
         hexacc = "%02x%02x%02x" % tuple(int(c*255) for c in acc)
         if (0.299*acc[0] + 0.587*acc[1] + 0.114*acc[2]) < 0.3:
             hexacc = "ffd23f"      # aksen gelap -> peluru tetap terang & terlihat
-        wdata[wid].append((spec[0], spec[1], spec[2], hexacc))
+        wdata[wid].append((spec[0], spec[1], spec[2], hexacc, 0, 0, "", WPRICE[spec[2]]))
+    for i, spec in enumerate(weaponskins.SKINS_FX[wid]):
+        im, acc = weaponskins.make_weapon_skin(wid, spec, 900 + i * 7 + len(wid))
+        im.save(f"{ROOT}/assets/sprites/weaponskins/{wid}/{spec[0]}.png", optimize=True)
+        hexacc = "%02x%02x%02x" % tuple(int(c*255) for c in acc)
+        if (0.299*acc[0] + 0.587*acc[1] + 0.114*acc[2]) < 0.3:
+            hexacc = "ffd23f"
+        p1, p2, p3 = weaponskins.PRICES_FX[spec[2]]
+        wdata[wid].append((spec[0], spec[1], spec[2], hexacc, p2, p3, spec[7], p1))
     print("wskin", wid, flush=True)
 
 # ---- koin
@@ -63,24 +78,30 @@ im.resize((96,96), Image.LANCZOS).save(f"{ROOT}/assets/sprites/ui/coin.png")
 def q(s): return '"%s"' % s
 L = []
 L.append("class_name CosmeticsData\nextends RefCounted\n## DIHASILKAN oleh tools/gen_all.py - jangan edit tangan (ubah generatornya lalu jalankan ulang).\n")
-L.append("const RARITY_ORDER := [\"common\", \"rare\", \"epic\", \"legendary\"]")
+L.append('const RARITY_ORDER := ["common", "rare", "epic", "legendary", "mythic"]')
 L.append("const EYE_Y := %s" % [e for e in EYE_Y])
-L.append("## Tema skin karakter: [id, nama, rarity, harga]  (dipakai untuk SEMUA 24 karakter)")
+L.append("## Skin karakter (dipakai untuk SEMUA 24 karakter): [id, nama, rarity, harga LV1, harga upgrade LV2, harga upgrade LV3]")
+L.append("## Skin lama: upgrade = 0 (tidak berlevel). Skin premium (upgrade > 0): LV1 sprite, LV2 + partikel, LV3 + animasi.")
 L.append("const CHAR_SKINS := [")
+for tid,tn,ra,fn,p1,p2,p3 in skins_fx.THEMES_FX:
+    L.append("\t[%s, %s, %s, %d, %d, %d]," % (q(tid), q(tn), q(ra), p1, p2, p3))
 for tid,tn,ra,fn in skins.THEMES:
-    L.append("\t[%s, %s, %s, %d]," % (q(tid), q(tn), q(ra), PRICE[ra]))
+    L.append("\t[%s, %s, %s, %d, 0, 0]," % (q(tid), q(tn), q(ra), PRICE[ra]))
 L.append("]")
-L.append("## Skin senjata per senjata: [id, nama, rarity, harga, warna_peluru_hex]")
+L.append("## Skin senjata per senjata: [id, nama, rarity, harga LV1, warna_peluru_hex, harga upgrade LV2, harga upgrade LV3, finisher]")
+L.append("## Skin premium (upgrade > 0): LV1 sprite, LV2 + partikel di senjata, LV3 + finisher kill terakhir.")
 L.append("const WEAPON_SKINS := {")
 for wid, lst in wdata.items():
     L.append("\t%s: [" % q(wid))
-    for sid,sn,ra,hx in lst:
-        L.append("\t\t[%s, %s, %s, %d, %s]," % (q(sid), q(sn), q(ra), WPRICE[ra], q(hx)))
+    prem = [e for e in lst if e[6] != ""]
+    old = [e for e in lst if e[6] == ""]
+    for sid,sn,ra,hx,p2,p3,fin_,p1 in prem + old:
+        L.append("\t\t[%s, %s, %s, %d, %s, %d, %d, %s]," % (q(sid), q(sn), q(ra), p1, q(hx), p2, p3, q(fin_)))
     L.append("\t],")
 L.append("}")
-L.append("## Aksesoris: [id, nama, slot, harga, rarity, layer]   slot: head/face/neck/back")
+L.append("## Aksesoris: [id, nama, slot, harga, rarity, layer]   slot: head/face/neck/back (aksesoris baru berani animasi: lihat fx_catalog.gd)")
 L.append("const ACCESSORIES := [")
-for (aid,nm,slot,pr,ra,layer,fn) in accessories.ACCESSORIES:
+for (aid,nm,slot,pr,ra,layer,fn) in accessories_fx.ACCESSORIES_FX + accessories.ACCESSORIES:
     L.append("\t[%s, %s, %s, %d, %s, %s]," % (q(aid), q(nm), q(slot), pr, q(ra), q(layer)))
 L.append("]")
 open(f"{ROOT}/scripts/cosmetics_data.gd","w").write("\n".join(L)+"\n")

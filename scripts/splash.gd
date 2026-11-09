@@ -5,7 +5,7 @@ extends Control
 ## Urutan:   1) GODOT ENGINE   2) EQUINOX   3) 3 DEVELOPER
 ## Tiap slide: fade in -> tahan -> fade out, dengan latar yang menyesuaikan logonya
 ## (Godot = biru gelap, Equinox = terang keperakan karena logonya abu-abu gelap, Developer = ungu gelap).
-## Setelah slide terakhir selesai, otomatis lanjut ke LOADING SCREEN (scenes/loading.tscn).
+## Setelah slide terakhir selesai, otomatis lanjut ke PENGECEK UPDATE (scenes/updater.tscn), lalu ke LOADING SCREEN (scenes/loading.tscn).
 ## Tekan tombol apa saja / klik / tombol controller untuk melewati SLIDE YANG SEDANG TAMPIL saja:
 ## Godot -> (skip) Equinox -> (skip) Developer -> (skip) Loading screen. Satu kali tekan = satu slide.
 ##
@@ -14,7 +14,7 @@ extends Control
 ##
 ## Mengubah durasi: ubah FADE_IN / HOLD / FADE_OUT di bawah.
 
-const NEXT_SCENE := "res://scenes/loading.tscn"
+const NEXT_SCENE := "res://scenes/updater.tscn"          # lalu pengecek update (scripts/updater.gd) -> loading screen
 
 const LEAD_IN := 0.5                 # layar hitam sebelum slide pertama (detik)
 const GAP := 0.3                     # layar hitam di antara slide (detik)

@@ -15,8 +15,10 @@ const SLOT_NAMES := {"head": "HEAD", "face": "FACE", "neck": "NECK", "back": "BA
 const WEAPON_IDS := ["smith", "kurval", "flamer", "scream", "pistol", "knife"]
 const RARITY_COLORS := {
 	"common": Color("c8cddc"), "rare": Color("46a0ff"), "epic": Color("be5aff"), "legendary": Color("ffcd3c"),
+	"mythic": Color("ff4f8f"),
 }
-const RARITY_NAMES := {"common": "COMMON", "rare": "RARE", "epic": "EPIC", "legendary": "LEGENDARY"}
+const RARITY_NAMES := {"common": "COMMON", "rare": "RARE", "epic": "EPIC", "legendary": "LEGENDARY", "mythic": "MYTHIC"}
+const MAX_LEVEL := 3
 ## Ukuran kanvas aksesoris (px) dan kotak karakter di dalamnya (karakter 180x180 di tengah).
 const ACC_CANVAS := 340.0
 const FACE_BOX := 180.0
@@ -40,6 +42,8 @@ static func _blank() -> Dictionary:
 		"skins": {},        # "char:skin_id" -> true
 		"wskins": {},       # "weapon:skin_id" -> true
 		"acc": {},          # acc_id -> true
+		"slv": {},          # skin karakter premium: "char:skin_id" -> level 1..3 (tidak ada = LV1)
+		"wlv": {},          # skin senjata premium: "weapon:skin_id" -> level 1..3 (tidak ada = LV1)
 		"loadouts": {},     # P1: "char:skin_id" | P2-P4: "p<n>:char:skin_id" -> {slot: acc_id}
 		"last_cskin": {},   # "char" -> skin_id terakhir dipakai
 		"last_wskin": {},   # "weapon" -> skin_id terakhir dipakai
@@ -242,6 +246,115 @@ static func buy_acc(aid: String) -> bool:
 	(_profile["acc"] as Dictionary)[aid] = true
 	save()
 	return true
+
+
+# ------------------------------------------------------------------ LEVEL skin premium (LV1 sprite, LV2 partikel, LV3 animasi / finisher)
+## Skin berlevel kalau harga upgrade LV2 > 0 (skin lama tidak berlevel -> selalu LV1).
+static func skin_max_level(sid: String) -> int:
+	var info: Array = char_skin_info(sid)
+	return MAX_LEVEL if info.size() >= 6 and int(info[4]) > 0 else 1
+
+
+static func wskin_max_level(weapon: String, sid: String) -> int:
+	var info: Array = weapon_skin_info(weapon, sid)
+	return MAX_LEVEL if info.size() >= 8 and int(info[5]) > 0 else 1
+
+
+## Level skin yang dimiliki (0 = belum punya).
+static func skin_level(ch: int, sid: String) -> int:
+	if sid == "":
+		return 1
+	if not owns_skin(ch, sid):
+		return 0
+	var mx: int = skin_max_level(sid)
+	if mx <= 1:
+		return 1
+	return clampi(int((_profile["slv"] as Dictionary).get("%d:%s" % [ch, sid], 1)), 1, mx)
+
+
+static func wskin_level(weapon: String, sid: String) -> int:
+	if sid == "":
+		return 1
+	if not owns_wskin(weapon, sid):
+		return 0
+	var mx: int = wskin_max_level(weapon, sid)
+	if mx <= 1:
+		return 1
+	return clampi(int((_profile["wlv"] as Dictionary).get("%s:%s" % [weapon, sid], 1)), 1, mx)
+
+
+## Harga untuk naik KE level `to_level` (2 atau 3). 0 = tidak ada.
+static func skin_upgrade_cost(sid: String, to_level: int) -> int:
+	var info: Array = char_skin_info(sid)
+	if info.size() < 6 or to_level < 2 or to_level > MAX_LEVEL:
+		return 0
+	return int(info[4]) if to_level == 2 else int(info[5])
+
+
+static func wskin_upgrade_cost(weapon: String, sid: String, to_level: int) -> int:
+	var info: Array = weapon_skin_info(weapon, sid)
+	if info.size() < 8 or to_level < 2 or to_level > MAX_LEVEL:
+		return 0
+	return int(info[5]) if to_level == 2 else int(info[6])
+
+
+## Total koin untuk memiliki skin sampai level `lv` (beli + semua upgrade).
+static func skin_total_cost(sid: String, lv: int) -> int:
+	var info: Array = char_skin_info(sid)
+	if info.is_empty():
+		return 0
+	var tot: int = int(info[3])
+	for l in range(2, lv + 1):
+		tot += skin_upgrade_cost(sid, l)
+	return tot
+
+
+static func wskin_total_cost(weapon: String, sid: String, lv: int) -> int:
+	var info: Array = weapon_skin_info(weapon, sid)
+	if info.is_empty():
+		return 0
+	var tot: int = int(info[3])
+	for l in range(2, lv + 1):
+		tot += wskin_upgrade_cost(weapon, sid, l)
+	return tot
+
+
+static func upgrade_skin(ch: int, sid: String) -> bool:
+	_ensure()
+	var cur: int = skin_level(ch, sid)
+	if cur < 1 or cur >= skin_max_level(sid):
+		return false
+	if not _spend(skin_upgrade_cost(sid, cur + 1)):
+		return false
+	(_profile["slv"] as Dictionary)["%d:%s" % [ch, sid]] = cur + 1
+	save()
+	return true
+
+
+static func upgrade_wskin(weapon: String, sid: String) -> bool:
+	_ensure()
+	var cur: int = wskin_level(weapon, sid)
+	if cur < 1 or cur >= wskin_max_level(weapon, sid):
+		return false
+	if not _spend(wskin_upgrade_cost(weapon, sid, cur + 1)):
+		return false
+	(_profile["wlv"] as Dictionary)["%s:%s" % [weapon, sid]] = cur + 1
+	save()
+	return true
+
+
+## Jenis finisher skin senjata ("" = tidak ada).
+static func wskin_finisher(weapon: String, sid: String) -> String:
+	var info: Array = weapon_skin_info(weapon, sid)
+	return String(info[7]) if info.size() >= 8 else ""
+
+
+## Level yang dibawa ke Player / Replay: {"skin": int, "w": {weapon_id: int}}
+static func levels_for(ch: int, skin: String, ws: Dictionary) -> Dictionary:
+	var w: Dictionary = {}
+	for k in ws:
+		w[String(k)] = wskin_level(String(k), String(ws[k]))
+	return {"skin": skin_level(ch, skin) if skin != "" else 1, "w": w}
 
 
 static func owned_counts() -> Dictionary:
@@ -480,10 +593,22 @@ static func bullet_color(weapon: String, sid: String) -> Color:
 	return Color(String(info[4])) if not info.is_empty() else Color(0, 0, 0, 0)
 
 
+## Jejak partikel peluru untuk skin senjata premium LV2+ (dipakai game & Replay).
+static func apply_bullet_fx(b: Bullet, weapon: String, sid: String, lv: int) -> void:
+	if lv < 2 or sid == "":
+		return
+	var info: Dictionary = FxCatalog.weapon_info(sid)
+	if info.is_empty():
+		return
+	b.fx_fam = String(info["fam"])
+	b.fx_c1 = info["c1"]
+	b.fx_c2 = info["c2"]
+
+
 # ------------------------------------------------------------------ pasang aksesoris di sprite
 ## Menambah Sprite2D aksesoris sebagai anak `holder` (biasanya sprite badan). Posisi wajah menyesuaikan karakter.
 ## `holder_tex_size` = ukuran tekstur karakter (180) supaya skala aksesoris ikut.
-static func attach_accessories(holder: Node2D, ch: int, lo: Dictionary) -> Array:
+static func attach_accessories(holder: Node2D, ch: int, lo: Dictionary, fx_k: float = 2.2) -> Array:
 	var made: Array = []
 	for slot in SLOTS:
 		if not lo.has(slot):
@@ -494,7 +619,14 @@ static func attach_accessories(holder: Node2D, ch: int, lo: Dictionary) -> Array
 		var tex: Texture2D = acc_tex(String(lo[slot]))
 		if tex == null:
 			continue
-		var sp := Sprite2D.new()
+		var sp: Sprite2D
+		if FxCatalog.has_acc_fx(String(lo[slot])):
+			var fa := FxAccSprite.new()      # aksesoris beranimasi
+			fa.aid = String(lo[slot])
+			fa.k_mul = fx_k
+			sp = fa
+		else:
+			sp = Sprite2D.new()
 		sp.texture = tex
 		sp.name = "Acc_" + slot
 		if String(info[5]) == "back":
@@ -502,6 +634,8 @@ static func attach_accessories(holder: Node2D, ch: int, lo: Dictionary) -> Array
 		if slot == "face":
 			var ey: float = float(CosmeticsData.EYE_Y[ch]) if ch >= 0 and ch < CosmeticsData.EYE_Y.size() else 60.0
 			sp.position.y = ey - 60.0     # aksesoris wajah digambar dengan garis mata 60px dari atas kotak
+			if sp is FxAccSprite:
+				(sp as FxAccSprite).base_pos = sp.position
 		holder.add_child(sp)
 		made.append(sp)
 	return made
@@ -525,7 +659,7 @@ static func apply_to_player(p: Player, sel: Dictionary) -> void:
 		var e: String = String(sel.get("pskin" if extra == "pistol" else "kskin", ""))
 		if e != "" and owns_wskin(extra, e):
 			ws[extra] = e
-	p.apply_cosmetics(skin, ws, loadout(ch, skin, int(p.index)))
+	p.apply_cosmetics(skin, ws, loadout(ch, skin, int(p.index)), levels_for(ch, skin, ws))
 
 
 # ------------------------------------------------------------------ gambar aksesoris di UI (preview)

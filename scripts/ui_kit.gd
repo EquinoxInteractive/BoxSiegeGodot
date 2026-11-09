@@ -93,8 +93,13 @@ static func text_in(ci: CanvasItem, s: String, rect: Rect2, fsize: int, color: C
 	var y: float = rect.position.y + (rect.size.y - (asc + desc)) * 0.5 + asc
 	var pos := Vector2(rect.position.x, y)
 	if outline > 0:
-		ci.draw_string_outline(fnt, pos, s, align, rect.size.x, fsize, outline, outline_color)
-	ci.draw_string(fnt, pos, s, align, rect.size.x, fsize, color)
+		# stroke ikut transparansi teks: saat teks masih fade-in, stroke juga ikut kosong (tidak ada stroke yang "tertinggal")
+		var oc: Color = outline_color
+		oc.a *= color.a
+		if oc.a > 0.003:
+			ci.draw_string_outline(fnt, pos, s, align, rect.size.x, fsize, outline, oc)
+	if color.a > 0.003:
+		ci.draw_string(fnt, pos, s, align, rect.size.x, fsize, color)
 
 
 static func text_w(s: String, fsize: int, f: Font = null) -> float:
@@ -581,6 +586,9 @@ class FancyButton extends Control:
 	var auto_hover: bool = false
 	## Transparansi saat tombol tidak disorot (hover / fokus keyboard-controller membuatnya penuh 1.0).
 	var idle_alpha: float = 1.0
+	## true = gaya RAPI: teks di tengah, bentuk simetris selebar kontrolnya, tepi aksen kiri & kanan mengikuti kemiringan,
+	## hover = membesar halus + menyala (tidak bergeser ke kanan). Dipakai tombol aksi di panel Shop / Inventory.
+	var tidy: bool = false
 	var sel: float = 0.0:
 		set(v):
 			sel = v
@@ -670,7 +678,51 @@ class FancyButton extends Control:
 	func _process(_d: float) -> void:
 		queue_redraw()
 
+	## Gaya rapi (lihat `tidy`): semua digambar simetris di dalam kotak kontrol.
+	func _draw_tidy() -> void:
+		var bw: float = size.x
+		var bh: float = size.y
+		var g: float = sel * 5.0
+		var pulse: float = 0.5 + 0.5 * sin(Time.get_ticks_msec() / 260.0)
+		var pts := UIKit.slanted(bw + g * 2.0, bh + g * 0.8, skew, -g, -g * 0.4)
+		draw_colored_polygon(UIKit.slanted(bw, bh, skew, 4.0, 5.0), Color(0, 0, 0, 0.45))
+		if sel > 0.01:
+			var gp := UIKit.slanted(bw + g * 2.0 + 14.0, bh + g * 0.8 + 14.0, skew, -g - 7.0, -g * 0.4 - 7.0)
+			draw_colored_polygon(gp, Color(accent, (0.14 + 0.1 * pulse) * sel))
+		var base := Color(0.07, 0.07, 0.16, 0.9)
+		var c0: Color = base.lerp(accent.lightened(0.35), sel)
+		var c1: Color = base.lerp(accent.darkened(0.12), sel)
+		draw_polygon(pts, PackedColorArray([c0, c0, c1, c1]))
+		# tepi aksen kiri & kanan (mengikuti kemiringan, simetris) - memudar saat tombol menyala
+		var ea: float = 0.55 * (1.0 - sel)
+		if ea > 0.01:
+			var eb: float = 6.0
+			draw_colored_polygon(PackedVector2Array([Vector2(skew, 0), Vector2(skew + eb, 0), Vector2(eb, bh), Vector2(0, bh)]), Color(accent, ea))
+			draw_colored_polygon(PackedVector2Array([Vector2(bw - eb, 0), Vector2(bw, 0), Vector2(bw - skew, bh), Vector2(bw - skew - eb, bh)]), Color(accent, ea))
+		draw_polyline(UIKit.closed(pts), Color(1, 1, 1, lerpf(0.16, 0.95, sel)), 2.0 + sel * 1.5, true)
+		if is_lit():
+			var ph: float = fmod(Time.get_ticks_msec() / 1000.0 * 0.7, 1.7) - 0.35
+			var sx: float = ph * bw
+			var band := PackedVector2Array([Vector2(sx + skew, 0), Vector2(sx + skew + 46.0, 0), Vector2(sx + 46.0, bh), Vector2(sx, bh)])
+			for poly in Geometry2D.intersect_polygons(band, pts):
+				draw_colored_polygon(poly, Color(1, 1, 1, 0.28))
+		if flash > 0.0:
+			draw_colored_polygon(pts, Color(1, 1, 1, 0.8 * flash))
+		var alpha: float = 0.35 if disabled else 1.0
+		var tcol: Color = UIKit.INK if sel > 0.5 else Color(1, 1, 1, 0.88)
+		tcol.a *= alpha
+		var tr := Rect2(skew + 6.0, 0, bw - skew * 2.0 - 12.0, bh)
+		var fs: int = font_size
+		while fs > 12 and UIKit.text_w(text, fs) > tr.size.x:
+			fs -= 1
+		if sel > 0.0:
+			UIKit.text_in(self, text, Rect2(tr.position + Vector2(2, 3), tr.size), fs, Color(0, 0, 0, 0.22 * sel), HORIZONTAL_ALIGNMENT_CENTER)
+		UIKit.text_in(self, text, tr, fs, tcol, HORIZONTAL_ALIGNMENT_CENTER)
+
 	func _draw() -> void:
+		if tidy:
+			_draw_tidy()
+			return
 		var shift: float = sel * 30.0
 		var bw: float = size.x - 34.0
 		var bh: float = size.y

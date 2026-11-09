@@ -8,6 +8,8 @@ enum State { INTRO, PLAYING, ROUND_END, MATCH_END }
 var map: Dictionary
 var state: int = State.INTRO
 var state_timer: float = 0.0
+var finisher_victim: Player = null
+var finisher_node: Finisher = null     # finisher kill terakhir yang sedang berjalan (skin senjata LV3)
 var intro_stage: int = 0
 var round_num: int = 0
 var time_left: float = 0.0
@@ -438,6 +440,7 @@ func spawn_bullet(p: Player, weapon: String = "") -> void:
 	b.setup(p.facing, float(w["bullet_speed"]), float(w["damage"]) * p.dmg_out * p.nerf_mult(float(w["damage"])), p.index, id, float(w.get("range", 0.0)))
 	b.team = p.team
 	b.skin_color = Cosmetics.bullet_color(id, String(p.wskins.get(id, "")))
+	Cosmetics.apply_bullet_fx(b, id, String(p.wskins.get(id, "")), int(p.wskin_lv.get(id, 1)))
 	var spread: float = float(w.get("spread", 0.0))
 	var jitter: float = rng.randf_range(-spread, spread) if spread > 0.0 else 0.0
 	b.position = p.global_position + Vector2(p.facing * (p.muzzle_x() - 6.0), 6.0 * p.size_mult + jitter)
@@ -1495,6 +1498,7 @@ func _physics_process(delta: float) -> void:
 		State.ROUND_END:
 			state_timer -= delta
 			if state_timer <= 0.0:
+				_clear_finisher()
 				var w := _match_winner()
 				if w >= 0:
 					_end_match(w)
@@ -1588,6 +1592,7 @@ func _spawn_positions() -> Array:
 
 
 func _on_player_died(p: Player) -> void:
+	var killer_idx: int = p.killer
 	if rec != null and state != State.MATCH_END:
 		var rk: int = p.killer
 		if rk >= 0 and (rk == p.index or rk >= team_ids.size() or team_ids[rk] == team_ids[p.index]):
@@ -1602,8 +1607,61 @@ func _on_player_died(p: Player) -> void:
 	var alive_teams: Array[int] = _alive_team_ids()
 	if alive_teams.size() == 1:
 		_end_round(alive_teams[0])
+		_try_finisher(p, killer_idx, alive_teams[0])
 	elif alive_teams.is_empty():
 		_end_round(-1)
+
+
+## Finisher: korban TERAKHIR (yang kematiannya mengakhiri ronde) dibunuh dengan skin senjata LV3 -> animasi sinematik.
+func _try_finisher(victim: Player, killer_idx: int, win_team: int) -> void:
+	if killer_idx < 0 or killer_idx == victim.index or killer_idx >= players.size():
+		return
+	if team_ids[killer_idx] == team_ids[victim.index]:
+		return
+	var k: Player = players[killer_idx]
+	var wid: String = victim.killer_weapon
+	if wid == "":
+		return
+	var sid: String = String(k.wskins.get(wid, ""))
+	if sid == "" or int(k.wskin_lv.get(wid, 1)) < 3:
+		return
+	var fin: String = Cosmetics.wskin_finisher(wid, sid)
+	var info: Dictionary = FxCatalog.weapon_info(sid)
+	if fin == "" or info.is_empty():
+		return
+	_clear_finisher()
+	var f := Finisher.new()
+	f.kind = fin
+	f.c1 = info["c1"]
+	f.c2 = info["c2"]
+	f.weapon = wid
+	var winfo: Array = Cosmetics.weapon_skin_info(wid, sid)
+	f.title = String(winfo[1]) if winfo.size() > 1 else ""
+	f.victim_tex = victim.portrait_tex(true)
+	f.vpos = victim.global_position
+	f.kpos = k.global_position
+	f.usize = Player.SIZE * victim.size_mult
+	f.bounds = Rect2(Vector2.ZERO, get_viewport_rect().size)
+	f.cam = cam
+	f.show_text = false          # ingame: tanpa teks banner finisher (layar bersih)
+	add_child(f)
+	finisher_node = f
+	finisher_victim = victim
+	victim.visible = false
+	state_timer = Finisher.D + 0.25
+	# ingame: tidak ada teks selama maupun setelah finisher (tanpa banner & tanpa "X WINS!")
+	_clear_message()
+	if rec != null:
+		rec.on_finisher(killer_idx, victim.index, wid, sid, fin, f.vpos, f.kpos)
+
+
+func _clear_finisher() -> void:
+	if finisher_node != null and is_instance_valid(finisher_node):
+		finisher_node.queue_free()
+	finisher_node = null
+	if finisher_victim != null and is_instance_valid(finisher_victim):
+		finisher_victim.visible = true
+	finisher_victim = null
 
 
 func _on_time_up() -> void:

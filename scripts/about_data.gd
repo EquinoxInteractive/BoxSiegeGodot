@@ -89,7 +89,7 @@ const TEAM := [
 const TECH_HEADING := "TECHNICAL INFO"
 ## [label, value]
 const TECH_INFO := [
-	["VERSION", "Beta 3.5"],
+	["VERSION", "3.6.0"],
 	["PLATFORM", "Windows"],
 	["ENGINE", "Godot Engine 4.7"],
 	["RELEASE DATE", "Oktober 2026"],

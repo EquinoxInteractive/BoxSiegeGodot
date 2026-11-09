@@ -94,6 +94,8 @@ func begin(g: Node) -> void:
 			"skin": pl.skin_id,
 			"wskins": pl.wskins.duplicate(),
 			"loadout": pl.loadout_data.duplicate(),
+			"skin_lv": pl.skin_lv,
+			"wskin_lv": pl.wskin_lv.duplicate(),
 			"team": tid,
 			"team_color": Global.team_color(tid) if g.team_mode else Global.PLAYER_COLORS[pl.index],
 			"team_level": Global.team_nerf_level(tid) if g.team_mode else 0,
@@ -167,6 +169,17 @@ func on_death(killer: int, victim: int) -> void:
 		rn = int((rounds[rounds.size() - 1] as Dictionary)["num"])
 	events.append({"t": time, "type": "kill" if killer >= 0 and killer != victim else "death",
 		"killer": killer, "victim": victim, "round": rn})
+
+
+## Finisher kill terakhir (skin senjata LV3): dimainkan ulang di Replay pada waktu yang sama.
+func on_finisher(killer: int, victim: int, wid: String, sid: String, fin: String, vpos: Vector2, kpos: Vector2) -> void:
+	if not active:
+		return
+	var rn: int = 0
+	if not rounds.is_empty():
+		rn = int((rounds[rounds.size() - 1] as Dictionary)["num"])
+	events.append({"t": time, "type": "finisher", "killer": killer, "victim": victim, "round": rn,
+		"wid": wid, "sid": sid, "fin": fin, "vx": vpos.x, "vy": vpos.y, "kx": kpos.x, "ky": kpos.y})
 
 
 # ------------------------------------------------------------------ indeks

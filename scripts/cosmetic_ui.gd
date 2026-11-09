@@ -64,8 +64,16 @@ var trans_pick: int = -1
 var trans_origin: Vector2 = Vector2.ZERO
 var trans_it: Dictionary = {}
 var dlg_layer: Control
+var stamp_layer: Control             # lapisan cap PURCHASED / EQUIPPED: di atas preview (FxStage) & panel
 
 # --- modal konfirmasi beli
+## Tombol aksi panel kanan: selebar kotak preview (362) dan di tengah panel -> simetris.
+## Target kursor di panel kanan (urutan atas -> bawah: PF_LV, PF_UP, PF_ACT).
+const PF_UP := 1
+const PF_ACT := 2
+const PF_LV := 3
+const BTN_W := 362.0
+const BTN_X := 24.0
 const DLG_W := 640.0
 const DLG_H := 372.0
 var dlg_open: bool = false            # true selama modal tampil (termasuk animasi keluar)
@@ -82,7 +90,13 @@ var dlg_prompt: UIKit.PromptBar
 
 var bg: UIKit.FxBackground
 var grid: GridView
+var fx_stage: FxStage                 # panggung preview hidup (partikel / animasi / finisher)
+var pv_lv: int = 1                    # level yang sedang di-preview (1..3)
+var pv_auto: bool = true              # true: preview berganti LV1 > LV2 > LV3 otomatis; tekan TAB / klik chip = manual
+var pv_t: float = 0.0
 var action_btn: UIKit.FancyButton
+var panel_focus: int = 0               # kursor di panel kanan (terkunci di sana sampai CANCEL): 0 = di grid, PF_UP / PF_ACT = tombol, PF_LV = baris LV1-3
+var upgrade_btn: UIKit.FancyButton   # INVENTORY (daftar skin karakter): tombol UPGRADE di samping CUSTOMIZE
 var back_btn: UIKit.FancyButton
 var prompt: UIKit.PromptBar
 var _hits: Array = []
@@ -170,10 +184,25 @@ func _ready() -> void:
 	grid.position = Vector2(GRID_X - GRID_PAD, 200.0 - GRID_PAD)
 	add_child(grid)
 
-	action_btn = UIKit.FancyButton.new("", Vector2(366, 54), 28)
-	action_btn.position = Vector2(PANEL_X + 22.0, 574.0)
+	fx_stage = FxStage.new()
+	add_child(fx_stage)
+
+	action_btn = UIKit.FancyButton.new("", Vector2(BTN_W, 54), 28)
+	action_btn.position = Vector2(PANEL_X + BTN_X, 574.0)
+	action_btn.tidy = true
+	action_btn.skew = 14.0
+	action_btn.auto_hover = true        # hover mouse: membesar + menyala + kursor tangan
 	action_btn.activated.connect(_on_action)
 	add_child(action_btn)
+
+	upgrade_btn = UIKit.FancyButton.new("", Vector2(BTN_W, 34), 22)
+	upgrade_btn.position = Vector2(PANEL_X + BTN_X, 558.0)
+	upgrade_btn.tidy = true
+	upgrade_btn.skew = 14.0
+	upgrade_btn.auto_hover = true
+	upgrade_btn.visible = false
+	upgrade_btn.activated.connect(_on_upgrade_btn)
+	add_child(upgrade_btn)
 
 	back_btn = UIKit.FancyButton.new("BACK", Vector2(190, 46), 28)
 	back_btn.position = Vector2(10, 662)
@@ -185,6 +214,10 @@ func _ready() -> void:
 	add_child(back_btn)
 
 	prompt = UIKit.make_prompt(self)
+
+	stamp_layer = StampLayer.new()
+	stamp_layer.ui = self
+	add_child(stamp_layer)
 
 	dlg_layer = DlgLayer.new()
 	dlg_layer.ui = self
@@ -247,13 +280,25 @@ func _update_prompt() -> void:
 		var bt: String = "BACK TO LIST" if (is_two_stage() and stage >= 1) else "BACK"
 		prompt.set_prompts([[&"dpad", "MOVE"], [&"none", "ACCEPT = %s" % bt], [&"back", bt]])
 		return
+	if panel_focus > 0:
+		if panel_focus == PF_LV:
+			prompt.set_prompts([[&"dpad", "MOVE"], [&"none", "LEFT / RIGHT = LEVEL"], [&"none", "ACCEPT = NEXT LV"], [&"back", "CANCEL"]])
+		else:
+			var bt2: String = String(action_btn.text if panel_focus == PF_ACT else upgrade_btn.text).split(" ")[0]
+			prompt.set_prompts([[&"dpad", "MOVE"], [&"none", "ACCEPT = %s" % bt2], [&"back", "CANCEL"]])
+		return
 	var acc_txt: String = "BUY" if shop_mode else "EQUIP"
 	if picking():
 		acc_txt = "OPEN"
-	elif kind() == "char" and stage == 1:
-		acc_txt = "CUSTOMIZE"
-	prompt.set_prompts([[&"dpad", "MOVE"], [&"none", "ACCEPT = %s" % acc_txt],
-		[&"none", "L / R = TAB"], [&"back", "BACK TO LIST" if (is_two_stage() and stage >= 1) else "BACK"]])
+	elif _uses_panel_step():
+		acc_txt = "SELECT"
+	var pl: Array = [[&"dpad", "MOVE"], [&"none", "ACCEPT = %s" % acc_txt],
+		[&"none", "L / R = TAB"], [&"back", "BACK TO LIST" if (is_two_stage() and stage >= 1) else "BACK"]]
+	if not picking() and (kind() == "cskin" or kind() == "wskin" or (kind() == "char" and stage == 1)):
+		pl.insert(3, [&"none", "Y / TAB = PREVIEW LV"])
+	if not shop_mode and kind() == "char" and stage == 1:
+		pl.insert(2, [&"alt", "UPGRADE", {"key": "U"}])
+	prompt.set_prompts(pl)
 
 
 func tab_title(k: String) -> String:
@@ -360,7 +405,33 @@ func items() -> Array:
 	return _items_cache
 
 
+## Menambah info level ke item skin premium: lv (level dimiliki, 0 = belum punya), maxlv, harga upgrade.
 func _build_items() -> Array:
+	var out: Array = _build_items_raw()
+	for it in out:
+		var d: Dictionary = it
+		var k: String = String(d.get("kind", ""))
+		if k == "cskin" and String(d.get("id", "")) != "":
+			var sid: String = String(d["id"])
+			var mx: int = Cosmetics.skin_max_level(sid)
+			d["maxlv"] = mx
+			d["lv"] = Cosmetics.skin_level(int(d["ch"]), sid)
+			d["up2"] = Cosmetics.skin_upgrade_cost(sid, 2)
+			d["up3"] = Cosmetics.skin_upgrade_cost(sid, 3)
+		elif k == "wskin":
+			var w: String = String(d["w"])
+			var sid2: String = String(d["id"])
+			var mx2: int = Cosmetics.wskin_max_level(w, sid2)
+			d["maxlv"] = mx2
+			d["lv"] = Cosmetics.wskin_level(w, sid2)
+			d["up2"] = Cosmetics.wskin_upgrade_cost(w, sid2, 2)
+			d["up3"] = Cosmetics.wskin_upgrade_cost(w, sid2, 3)
+		elif k == "acc" and not bool(d.get("none", false)):
+			d["fx"] = FxCatalog.has_acc_fx(String(d["id"]))
+	return out
+
+
+func _build_items_raw() -> Array:
 	var out: Array = []
 	if picking():
 		if kind() == "cskin" or kind() == "char":
@@ -462,8 +533,14 @@ func cur_item() -> Dictionary:
 
 
 func _update_action_btn() -> void:
+	_update_action_btn_raw()
+	_validate_panel_focus()
+
+
+func _update_action_btn_raw() -> void:
 	if action_btn == null:
 		return
+	_layout_action_btns(false)
 	var it: Dictionary = cur_item()
 	if it.is_empty():
 		action_btn.visible = false
@@ -480,6 +557,14 @@ func _update_action_btn() -> void:
 		if bool(it["owned"]):
 			action_btn.text = "CUSTOMIZE"
 			action_btn.accent = UIKit.CYAN
+			if _can_upgrade(it):
+				# tombol UPGRADE muncul di atas CUSTOMIZE (hanya kalau skin ini masih bisa dinaikkan levelnya)
+				var upc0: int = _upgrade_cost(it)
+				_layout_action_btns(true)
+				upgrade_btn.text = "UPGRADE LV%d   %s" % [int(it["lv"]) + 1, _fmt(upc0)]
+				upgrade_btn.accent = UIKit.GOLD if Cosmetics.can_afford(upc0) else Color("ff7a7a")
+				upgrade_btn.disabled = false
+				upgrade_btn.queue_redraw()
 		else:
 			action_btn.text = "LOCKED"
 			action_btn.disabled = true
@@ -487,8 +572,13 @@ func _update_action_btn() -> void:
 		return
 	var owned: bool = bool(it["owned"])
 	if shop_mode:
-		if owned:
-			action_btn.text = "OWNED"
+		if owned and _can_upgrade(it):
+			var upc: int = _upgrade_cost(it)
+			action_btn.text = "UPGRADE LV%d   %s" % [int(it["lv"]) + 1, _fmt(upc)]
+			if not Cosmetics.can_afford(upc):
+				action_btn.accent = Color("ff7a7a")
+		elif owned:
+			action_btn.text = "MAX LEVEL" if int(it.get("maxlv", 1)) > 1 else "OWNED"
 			action_btn.disabled = true
 			action_btn.accent = UIKit.GREEN
 		else:
@@ -507,13 +597,195 @@ func _update_action_btn() -> void:
 				action_btn.disabled = true
 			action_btn.accent = UIKit.GREEN if bool(it.get("equipped", false)) else UIKit.GOLD
 		elif k == "wskin":
-			action_btn.text = "OWNED"          # INVENTORY: skin senjata hanya untuk dilihat
-			action_btn.disabled = true
-			action_btn.accent = UIKit.GREEN
+			if _can_upgrade(it):               # INVENTORY: skin senjata hanya bisa di-UPGRADE (tidak bisa beli)
+				var upw: int = _upgrade_cost(it)
+				action_btn.text = "UPGRADE LV%d   %s" % [int(it["lv"]) + 1, _fmt(upw)]
+				action_btn.accent = UIKit.GOLD if Cosmetics.can_afford(upw) else Color("ff7a7a")
+			else:
+				action_btn.text = "MAX LEVEL" if int(it.get("maxlv", 1)) > 1 else "OWNED"
+				action_btn.disabled = true
+				action_btn.accent = UIKit.GREEN
 		else:
 			action_btn.text = "CUSTOMIZE"
 			action_btn.accent = UIKit.CYAN
 	action_btn.queue_redraw()
+
+
+func _can_upgrade(it: Dictionary) -> bool:
+	return bool(it.get("owned", false)) and int(it.get("maxlv", 1)) > 1 and int(it.get("lv", 1)) < int(it.get("maxlv", 1))
+
+
+func _upgrade_cost(it: Dictionary) -> int:
+	return int(it.get("up2", 0)) if int(it.get("lv", 1)) < 2 else int(it.get("up3", 0))
+
+
+## Atur ukuran tombol aksi: mode biasa = 1 tombol besar; mode `dual` = UPGRADE (atas) + CUSTOMIZE (bawah), lebih ramping.
+func _layout_action_btns(dual: bool) -> void:
+	if action_btn == null or upgrade_btn == null:
+		return
+	upgrade_btn.visible = dual
+	# dual: UPGRADE (558..592) + tombol aksi (600..634), jarak 8px, sisa 12px dari tepi bawah panel; tidak menimpa teks deskripsi
+	var asz: Vector2 = Vector2(BTN_W, 34) if dual else Vector2(BTN_W, 54)
+	action_btn.position = Vector2(PANEL_X + BTN_X, 600.0 if dual else 574.0)
+	action_btn.custom_minimum_size = asz
+	action_btn.size = asz
+	action_btn.pivot_offset = asz * 0.5
+	action_btn.font_size = 22 if dual else 28
+	upgrade_btn.position = Vector2(PANEL_X + BTN_X, 558.0)
+
+
+## Pindahkan kursor ke elemen panel kanan (PF_UP / PF_ACT / PF_LV), atau 0 = kembali ke grid.
+func _set_panel_focus(v: int, sfx: bool = true) -> void:
+	if panel_focus == v:
+		return
+	panel_focus = v
+	if action_btn != null:
+		action_btn.set_selected(v == PF_ACT)
+	if upgrade_btn != null:
+		upgrade_btn.set_selected(v == PF_UP)
+	if sfx:
+		Global.play_sfx("ui_hover", -9.0)
+	_update_prompt()
+	queue_redraw()
+	if grid != null:
+		grid.queue_redraw()
+
+
+func _btn_ready(b: UIKit.FancyButton) -> bool:
+	return b != null and b.visible and not b.disabled
+
+
+## Elemen panel kanan yang bisa dipilih kursor untuk item yang disorot, urut atas -> bawah:
+## baris preview LV1-3, tombol UPGRADE (khusus daftar skin karakter di Inventory), tombol aksi.
+func _panel_targets() -> Array:
+	var out: Array = []
+	var it: Dictionary = cur_item()
+	if it.is_empty() or picking() or trans_active:
+		return out
+	if _is_fx_item(it) and String(it.get("kind", "")) != "acc":
+		out.append(PF_LV)
+	if _btn_ready(upgrade_btn):
+		out.append(PF_UP)
+	if _btn_ready(action_btn):
+		out.append(PF_ACT)
+	return out
+
+
+## true = ACCEPT di kartu grid TIDAK langsung beraksi: kursor pindah dulu ke panel kanan (pilih UPGRADE / preview LV / tombol aksi).
+## Pengecualian: pemilih karakter / senjata (langsung buka daftar skin) dan pasang-lepas aksesoris di Inventory (toggle cepat).
+func _uses_panel_step() -> bool:
+	if picking():
+		return false
+	if shop_mode:
+		return true
+	return (kind() == "char" and stage == 1) or kind() == "wskin"
+
+
+func _enter_panel(tg: Array) -> void:
+	row = grid_row()
+	var first: int = PF_UP if tg.has(PF_UP) else (PF_ACT if tg.has(PF_ACT) else int(tg[0]))
+	Global.play_sfx("ui_panel", -10.0)
+	_set_panel_focus(first, false)
+	_update_prompt()
+
+
+## Jaga agar kursor tidak menempel di elemen yang sudah hilang / nonaktif (mis. setelah upgrade sampai level maksimal).
+func _validate_panel_focus() -> void:
+	if panel_focus == 0:
+		return
+	var tg: Array = _panel_targets()
+	if tg.is_empty():
+		_set_panel_focus(0, false)
+	elif not tg.has(panel_focus):
+		_set_panel_focus(PF_ACT if tg.has(PF_ACT) else (PF_UP if tg.has(PF_UP) else int(tg[0])), false)
+
+
+## Input saat kursor terkunci di panel kanan. true = input sudah ditangani. Keluar hanya lewat BACK / CANCEL.
+func _panel_input(action: StringName) -> bool:
+	var order: Array = _panel_targets()
+	var idx: int = order.find(panel_focus)
+	match action:
+		&"up":
+			if idx > 0:
+				_set_panel_focus(int(order[idx - 1]))
+			return true
+		&"down":
+			if idx >= 0 and idx < order.size() - 1:
+				_set_panel_focus(int(order[idx + 1]))
+			return true
+		&"left", &"right":
+			if panel_focus == PF_LV:
+				var nl: int = clampi(pv_lv + (-1 if action == &"left" else 1), 1, 3)
+				if nl != pv_lv:
+					_pv_set(nl)
+			return true
+		&"accept":
+			if panel_focus == PF_LV:
+				_pv_cycle()
+			elif panel_focus == PF_UP:
+				upgrade_btn.press()
+			elif panel_focus == PF_ACT:
+				action_btn.press()
+			return true
+		&"back":
+			Global.play_sfx("ui_back", -8.0)
+			_set_panel_focus(0, false)      # CANCEL: balik ke daftar item
+			return true
+		&"prev", &"next":
+			return true                     # tab terkunci selama kursor di panel
+	return false
+
+
+## Coba upgrade skin `it` (INVENTORY maupun SHOP): cek level & koin, lalu buka modal konfirmasi.
+func _try_upgrade(it: Dictionary) -> void:
+	if it.is_empty() or dlg_open:
+		return
+	if not bool(it.get("owned", false)):
+		_deny("LOCKED", "Buy it in the SHOP")
+		return
+	if not _can_upgrade(it):
+		if int(it.get("maxlv", 1)) > 1:
+			UIInput.toast("MAX LEVEL", "This skin is fully upgraded", UIKit.GREEN)
+			Global.play_sfx("ui_hover", -9.0)
+		else:
+			Global.play_sfx("ui_error", -12.0)
+		return
+	var upc: int = _upgrade_cost(it)
+	if not Cosmetics.can_afford(upc):
+		_deny("NOT ENOUGH COINS", "You need %s more" % _fmt(upc - Cosmetics.coins()))
+		return
+	var up_it: Dictionary = it.duplicate()
+	up_it["upgrade_to"] = int(it["lv"]) + 1
+	up_it["price"] = upc
+	_open_dialog(up_it)
+
+
+func _on_upgrade_btn() -> void:
+	if dlg_open or leaving or trans_active:
+		return
+	row = grid_row()
+	_try_upgrade(cur_item())
+
+
+## Hotkey keyboard: U = upgrade skin yang disorot (INVENTORY, daftar skin karakter). Pad: tombol X (&"alt").
+func _unhandled_key_input(event: InputEvent) -> void:
+	var ke := event as InputEventKey
+	if ke == null or not ke.pressed or ke.echo or ke.keycode != KEY_U:
+		return
+	if leaving or trans_active or dlg_open or back_focus or shop_mode:
+		return
+	if kind() == "char" and stage == 1 and not picking():
+		_try_upgrade(cur_item())
+		get_viewport().set_input_as_handled()
+
+
+## Item dengan preview berlevel / beranimasi (skin premium, aksesoris beranimasi).
+func _is_fx_item(it: Dictionary) -> bool:
+	match String(it.get("kind", "")):
+		"cskin": return int(it.get("maxlv", 1)) > 1
+		"wskin": return int(it.get("maxlv", 1)) > 1
+		"acc": return bool(it.get("fx", false))
+	return false
 
 
 func _fmt(n: int) -> String:
@@ -564,6 +836,8 @@ func _on_input(_source: int, action: StringName) -> void:
 				_focus_back(false)      # lanjut: ganti tab seperti biasa
 			_:
 				return
+	if panel_focus > 0 and _panel_input(action):
+		return
 	match action:
 		&"up":
 			_move_row(-1)
@@ -577,6 +851,13 @@ func _on_input(_source: int, action: StringName) -> void:
 			_set_tab(posmod(tab - 1, kinds.size()))
 		&"next":
 			_set_tab(posmod(tab + 1, kinds.size()))
+		&"extra":
+			_pv_cycle()
+		&"alt":
+			if not shop_mode and kind() == "char" and stage == 1 and not picking():
+				_try_upgrade(cur_item())
+			else:
+				_pv_replay()
 		&"accept":
 			if row == grid_row():
 				_activate()
@@ -657,6 +938,7 @@ func _focus_back(on: bool) -> void:
 
 
 func _clear_back_focus() -> void:
+	_set_panel_focus(0, false)
 	if not back_focus:
 		return
 	back_focus = false
@@ -711,6 +993,7 @@ func _enter_stage(it: Dictionary) -> void:
 
 
 func _finish_enter() -> void:
+	_set_panel_focus(0, false)
 	var it: Dictionary = trans_it
 	var k: String = String(it["kind"])
 	if k == "pchar":
@@ -764,6 +1047,7 @@ func _exit_stage() -> void:
 
 
 func _finish_exit() -> void:
+	_set_panel_focus(0, false)
 	if kind() == "char" and stage == 2:
 		stage = 1                     # dari kustomisasi balik ke daftar skin
 		cur = sel_skin
@@ -812,7 +1096,21 @@ func _follow_cursor() -> void:
 	scroll_to = maxf(scroll_to, 0.0)
 
 
+## ACCEPT di kartu grid. Item skin / belanjaan: kursor pindah ke panel kanan dulu (lihat _uses_panel_step), baru dipilih aksinya.
 func _activate() -> void:
+	var it: Dictionary = cur_item()
+	if it.is_empty():
+		return
+	if not picking() and _uses_panel_step():
+		var tg: Array = _panel_targets()
+		if not tg.is_empty():
+			_enter_panel(tg)
+			return
+	_primary_action()
+
+
+## Aksi tombol utama untuk item yang disorot (BUY / UPGRADE / CUSTOMIZE / EQUIP / VIEW SKINS).
+func _primary_action() -> void:
 	var it: Dictionary = cur_item()
 	if it.is_empty():
 		return
@@ -827,6 +1125,9 @@ func _activate() -> void:
 		return
 	if shop_mode:
 		if bool(it["owned"]):
+			if _can_upgrade(it):
+				_try_upgrade(it)
+				return
 			Global.play_sfx("ui_error", -12.0)
 			return
 		var pr: int = int(it["price"])
@@ -857,10 +1158,16 @@ func _activate() -> void:
 		_burst_preview(Color("4fd8ff"))
 		_refresh()
 	elif k == "wskin":
-		# INVENTORY: skin senjata hanya untuk dilihat. Skin senjata utama, pistol dan pisau dipilih di FIGHTER SELECT.
+		# INVENTORY: skin senjata bisa di-UPGRADE (tidak bisa dibeli). Skin senjata dipilih di FIGHTER SELECT.
+		if _can_upgrade(it):
+			_try_upgrade(it)
+			return
 		var w: String = String(it.get("w", ""))
 		Global.play_sfx("ui_hover", -9.0)
-		UIInput.toast("VIEW ONLY", "Pick %s skins in FIGHTER SELECT" % String(Global.WEAPONS[w]["name"]), UIKit.GOLD)
+		if int(it.get("maxlv", 1)) > 1:
+			UIInput.toast("MAX LEVEL", "Pick %s skins in FIGHTER SELECT" % String(Global.WEAPONS[w]["name"]), UIKit.GREEN)
+		else:
+			UIInput.toast("VIEW ONLY", "Pick %s skins in FIGHTER SELECT" % String(Global.WEAPONS[w]["name"]), UIKit.GOLD)
 
 
 func _deny(title: String, sub: String) -> void:
@@ -952,17 +1259,21 @@ func _dialog_answer(yes: bool) -> void:
 		return
 	var it: Dictionary = dlg_item
 	var ok: bool = false
+	var upgrading: bool = it.has("upgrade_to")
 	match String(it["kind"]):
 		"cskin":
-			ok = Cosmetics.buy_skin(int(it["ch"]), String(it["id"]))
+			ok = Cosmetics.upgrade_skin(int(it["ch"]), String(it["id"])) if upgrading else Cosmetics.buy_skin(int(it["ch"]), String(it["id"]))
 		"wskin":
-			ok = Cosmetics.buy_wskin(String(it["w"]), String(it["id"]))
+			ok = Cosmetics.upgrade_wskin(String(it["w"]), String(it["id"])) if upgrading else Cosmetics.buy_wskin(String(it["w"]), String(it["id"]))
 		"acc":
 			ok = Cosmetics.buy_acc(String(it["id"]))
 	if ok:
 		Global.play_synth("coin", -4.0, 1.0)
 		Global.play_sfx("ui_marimba", -6.0, 1.2)
-		stamp("PURCHASED!")
+		stamp("UPGRADED!" if upgrading else "PURCHASED!")
+		if upgrading:
+			pv_lv = int(it["upgrade_to"])
+			pv_auto = false
 		var col: Color = Cosmetics.rarity_color(String(it["rarity"]))
 		_burst_preview(col)
 		UIKit.ring(self, Vector2(PANEL_X + 205.0, 300.0), col, 190.0, 0.6)
@@ -995,7 +1306,7 @@ func _on_action() -> void:
 		_update_action_btn()
 		return
 	row = grid_row()
-	_activate()
+	_primary_action()
 
 
 func _go_back() -> void:
@@ -1065,6 +1376,10 @@ func _on_hit(type: String, a: int) -> void:
 		"sel_r":
 			row = a + 1
 			sel_step(a, 1)
+		"pvlv":
+			_pv_set(a)
+		"pvfin":
+			_pv_replay()
 		"card":
 			row = grid_row()
 			if a == cur:
@@ -1097,6 +1412,7 @@ func _process(d: float) -> void:
 		grid_t += d
 	stage_t += d
 	panel_t += d
+	pv_t += d
 	flash_t = maxf(flash_t - d * 2.6, 0.0)
 	_tick_dialog(d)
 	tab_f = lerpf(tab_f, float(tab), minf(1.0, d * 14.0))
@@ -1106,6 +1422,8 @@ func _process(d: float) -> void:
 	_track_panel()
 	if dlg_layer != null:
 		dlg_layer.queue_redraw()
+	if stamp_layer != null:
+		stamp_layer.queue_redraw()
 	var target: float = float(Cosmetics.coins())
 	coins_shown = lerpf(coins_shown, target, minf(1.0, d * 7.0))
 	if absf(coins_shown - target) < 0.6:
@@ -1117,6 +1435,8 @@ func _process(d: float) -> void:
 		scroll = scroll_to
 	action_btn.mouse_filter = Control.MOUSE_FILTER_IGNORE if dlg_open else Control.MOUSE_FILTER_STOP
 	back_btn.mouse_filter = Control.MOUSE_FILTER_IGNORE if dlg_open else Control.MOUSE_FILTER_STOP
+	if upgrade_btn != null:
+		upgrade_btn.mouse_filter = Control.MOUSE_FILTER_IGNORE if dlg_open else Control.MOUSE_FILTER_STOP
 	queue_redraw()
 	if grid != null:
 		grid.queue_redraw()
@@ -1149,6 +1469,9 @@ func _track_panel() -> void:
 	if key != panel_key:
 		panel_key = key
 		panel_t = 0.0
+		pv_auto = true
+		pv_t = 0.0
+		pv_lv = 1
 
 
 static func ease_in(x: float) -> float:
@@ -1486,6 +1809,135 @@ func _preview_char() -> int:
 	return sel_char
 
 
+
+# ------------------------------------------------------------------ preview level (LV1-3) skin premium
+const LV_TITLES_CHAR := ["BASE", "PARTICLES", "ANIMATION"]
+const LV_TITLES_WEAPON := ["BASE", "PARTICLES", "FINISHER"]
+
+
+func _pv_set(l: int) -> void:
+	var it: Dictionary = cur_item()
+	if it.is_empty() or int(it.get("maxlv", 1)) <= 1:
+		return
+	pv_auto = false
+	pv_lv = clampi(l, 1, 3)
+	pv_t = 0.0
+	Global.play_sfx("ui_move", -10.0, 0.9 + 0.12 * float(pv_lv))
+	if fx_stage != null and pv_lv == 3:
+		fx_stage.replay_finisher()
+
+
+func _pv_cycle() -> void:
+	var it: Dictionary = cur_item()
+	if it.is_empty() or int(it.get("maxlv", 1)) <= 1:
+		return
+	_pv_set(pv_lv % 3 + 1)
+
+
+func _pv_replay() -> void:
+	var it: Dictionary = cur_item()
+	if it.is_empty() or String(it.get("kind", "")) != "wskin" or pv_lv < 3 or int(it.get("maxlv", 1)) <= 1:
+		return
+	fx_stage.replay_finisher()
+	Global.play_sfx("ui_hover", -9.0)
+
+
+## Deskripsi apa yang didapat di level tertentu: [judul, penjelasan]
+func _lv_desc(it: Dictionary, lv: int) -> Array:
+	var is_w: bool = String(it["kind"]) == "wskin"
+	if lv == 1:
+		return ["LV1  -  BASE SKIN", "Premium artwork only - no particles, no %s" % ("finisher" if is_w else "animation")]
+	if is_w:
+		var info: Dictionary = FxCatalog.weapon_info(String(it["id"]))
+		var fam: String = String(info.get("fam", ""))
+		if lv == 2:
+			return ["LV2  -  PARTICLE EFFECTS", String(FxCatalog.FAM_L2.get(fam, "Particle effects on the weapon"))]
+		var fin: String = Cosmetics.wskin_finisher(String(it["w"]), String(it["id"]))
+		var fi: Dictionary = FxCatalog.FIN.get(fin, {})
+		return ["LV3  -  FINISHER: %s" % String(fi.get("name", "")), String(fi.get("desc", "Last-kill finisher"))]
+	var ci: Dictionary = FxCatalog.char_info(String(it["id"]))
+	if lv == 2:
+		return ["LV2  -  PARTICLE EFFECTS", String(ci.get("l2", "Particle effects"))]
+	return ["LV3  -  LIVE ANIMATION", String(ci.get("l3", "Animated skin"))]
+
+
+## Panggung hidup + chip LV1/LV2/LV3 untuk item premium. Dipanggil dari _draw_panel.
+func _fx_panel(it: Dictionary, area: Rect2, rc: Color, owned: bool, tint: Color, ps: float) -> void:
+	var kd: String = String(it["kind"])
+	var has_lv: bool = kd != "acc"
+	var stage_r := Rect2(area.position, Vector2(area.size.x, area.size.y - (50.0 if has_lv else 30.0)))
+	fx_stage.position = stage_r.position
+	fx_stage.size = stage_r.size
+	fx_stage.pop = ps
+	if has_lv:
+		if pv_auto:
+			var lens: Array = [3.0, 3.4, 5.6 if kd == "wskin" else 4.2]
+			var tt: float = fposmod(pv_t, 3.0 + 3.4 + float(lens[2]))
+			pv_lv = 1 if tt < 3.0 else (2 if tt < 6.4 else 3)
+		var lv_prev: int = pv_lv
+		match kd:
+			"cskin":
+				var lo0: Dictionary = {}
+				if not shop_mode:
+					lo0 = Cosmetics.loadout_cached(int(it["ch"]), String(it["id"]), sel_pl)
+				fx_stage.setup_char(int(it["ch"]), String(it["id"]), lv_prev, lo0, tint)
+			"wskin":
+				fx_stage.setup_weapon(String(it["w"]), String(it["id"]), lv_prev, tint, clampi(sel_char, 0, Global.character_count() - 1))
+		if kd == "wskin" and pv_lv >= 3:
+			_hits.append({"rect": stage_r, "type": "pvfin", "a": 0})
+		# ---- chip LV1 / LV2 / LV3
+		var cw: float = (area.size.x - 8.0) / 3.0
+		var y0: float = area.end.y - 46.0
+		var lv_own: int = int(it.get("lv", 0)) if owned else 0
+		var titles: Array = LV_TITLES_WEAPON if kd == "wskin" else LV_TITLES_CHAR
+		for i in 3:
+			var lvn: int = i + 1
+			var r := Rect2(area.position.x + 4.0 + float(i) * cw, y0 + 2.0, cw - 4.0, 42.0)
+			var locked: bool = lvn > lv_own
+			var sel: bool = lvn == pv_lv
+			var bgc: Color = Color(0.04, 0.04, 0.1, 0.92).lerp(rc.darkened(0.35), 0.6 if sel else 0.0)
+			draw_rect(r, bgc)
+			draw_rect(r, Color(rc, 1.0 if sel else 0.35), false, 3.0 if sel else 1.5)
+			var al: float = 0.6 if locked else 1.0
+			UIKit.text_in(self, "LV%d" % lvn, Rect2(r.position.x, r.position.y + 1.0, r.size.x, 22.0), 20, Color(1, 1, 1, al), HORIZONTAL_ALIGNMENT_CENTER, 4)
+			var sub: String = String(titles[i])
+			var sc: Color = Color(rc.lightened(0.35), al)
+			if locked and shop_mode:
+				var pr: int = int(it["price"]) if lvn == 1 else int(it["up%d" % lvn])
+				sub = _fmt(pr)
+				sc = UIKit.GOLD if Cosmetics.can_afford(pr) else Color("ff7a7a")
+			UIKit.text_in(self, sub, Rect2(r.position.x, r.position.y + 22.0, r.size.x, 18.0), 14, sc, HORIZONTAL_ALIGNMENT_CENTER, 3)
+			if locked:
+				UIKit.draw_lock(self, r.position + Vector2(r.size.x - 14.0, 13.0), 15.0, Color(1, 1, 1, 0.8))
+			elif lvn == lv_own:
+				draw_circle(r.position + Vector2(12.0, 12.0), 6.0, UIKit.GREEN)
+			_hits.append({"rect": r, "type": "pvlv", "a": lvn})
+		if panel_focus == PF_LV:
+			var fr := Rect2(area.position.x + 1.0, y0, area.size.x - 2.0, 46.0)
+			var fpl: float = 0.5 + 0.5 * sin(t * 6.0)
+			draw_rect(fr.grow(3.0), Color(UIKit.GOLD, 0.12 + 0.1 * fpl))
+			draw_rect(fr, Color(UIKit.GOLD, 0.65 + 0.35 * fpl), false, 3.0)
+	else:
+		# aksesoris beranimasi
+		var pc: int = _preview_char()
+		var sid: String = ""
+		var lo: Dictionary = {}
+		if not shop_mode:
+			pc = sel_char
+			sid = cur_skin_id()
+			lo = Cosmetics.loadout_cached(pc, sid, sel_pl).duplicate()
+			var slot: String = String(it["slot"])
+			lo[slot] = String(it["id"])
+		else:
+			lo = {String(it["slot"]): String(it["id"])}
+		fx_stage.setup_acc(pc, sid, lo, tint)
+		var desc: String = String((FxCatalog.ACC.get(String(it["id"]), ["", "", ""]) as Array)[2])
+		UIKit.text_in(self, "ANIMATED  -  " + desc, Rect2(area.position.x + 6.0, area.end.y - 28.0, area.size.x - 12.0, 24.0),
+			_fit("ANIMATED  -  " + desc, area.size.x - 12.0, 15), Color(rc.lightened(0.4), 0.95), HORIZONTAL_ALIGNMENT_CENTER, 3)
+		if shop_mode:
+			UIKit.text_in(self, Global.character_name(0, pc), Rect2(area.position.x + 6.0, area.position.y + 4.0, 160.0, 20.0), 14, Color(1, 1, 1, 0.5), HORIZONTAL_ALIGNMENT_LEFT, 3)
+
+
 func _draw_panel() -> void:
 	var e: float = CosmeticUI.ease_out(clampf((_intro - 0.1) / 0.5, 0.0, 1.0))
 	var px: float = PANEL_X + (1.0 - e) * 420.0
@@ -1528,7 +1980,12 @@ func _draw_panel() -> void:
 	var tint: Color = Color.WHITE if (owned or shop_mode) else Color(0.28, 0.28, 0.32, 1.0)
 	var bob: float = sin(t * 2.0) * 6.0
 	var ac: Vector2 = area.get_center() + Vector2(0, bob)
-	match String(it["kind"]):
+	var fxp: bool = _is_fx_item(it) and not picking() and not trans_active
+	if fxp:
+		_fx_panel(it, area, rc, owned, tint, ps)
+	elif fx_stage != null and fx_stage.visible:
+		fx_stage.clear()
+	match "" if fxp else String(it["kind"]):
 		"pchar":
 			draw_set_transform(ac, -(1.0 - pf) * 0.22, Vector2.ONE)
 			var facep := Rect2(-Vector2(100, 100) * ps, Vector2(200, 200) * ps)
@@ -1592,7 +2049,7 @@ func _draw_panel() -> void:
 				UIKit.text_in(self, Global.character_name(0, pc), Rect2(area.position.x, area.end.y - 28.0, area.size.x, 24.0), 16, Color(1, 1, 1, 0.55), HORIZONTAL_ALIGNMENT_CENTER, 3)
 	# kilau untuk epic / legendary
 	var rar: String = String(it["rarity"])
-	if rar == "epic" or rar == "legendary":
+	if rar == "epic" or rar == "legendary" or rar == "mythic":
 		for k in 7:
 			var a: float = t * 0.8 + float(k) * TAU / 7.0
 			var rr: float = 128.0 + 18.0 * sin(t * 2.0 + float(k))
@@ -1611,6 +2068,15 @@ func _draw_panel() -> void:
 	elif shop_mode and not owned:
 		draw_coin(self, Vector2(cx - 62.0, iy + 22.0), 36.0, t, true)
 		UIKit.text_in(self, _fmt(int(it["price"])), Rect2(cx - 38.0, iy, 200.0, 44.0), 38, UIKit.GOLD if Cosmetics.can_afford(int(it["price"])) else Color("ff7a7a"), HORIZONTAL_ALIGNMENT_LEFT, 7)
+	elif owned and int(it.get("maxlv", 1)) > 1:
+		if shop_mode and _can_upgrade(it):
+			var upc: int = _upgrade_cost(it)
+			UIKit.text_in(self, "UPGRADE LV%d" % (int(it["lv"]) + 1), Rect2(px + 24.0, iy - 4.0, 380.0, 22.0), 17, rc.lightened(0.3), HORIZONTAL_ALIGNMENT_CENTER, 4)
+			draw_coin(self, Vector2(cx - 62.0, iy + 28.0), 32.0, t, true)
+			UIKit.text_in(self, _fmt(upc), Rect2(cx - 38.0, iy + 6.0, 200.0, 40.0), 34, UIKit.GOLD if Cosmetics.can_afford(upc) else Color("ff7a7a"), HORIZONTAL_ALIGNMENT_LEFT, 7)
+		else:
+			var mxl: bool = int(it["lv"]) >= int(it["maxlv"])
+			UIKit.text_in(self, "MAX LEVEL" if mxl else "LEVEL %d / %d" % [int(it["lv"]), int(it["maxlv"])], Rect2(px, iy, 410.0, 44.0), 34, UIKit.GREEN if mxl else UIKit.CYAN, HORIZONTAL_ALIGNMENT_CENTER, 7)
 	elif owned:
 		UIKit.text_in(self, "OWNED", Rect2(px, iy, 410.0, 44.0), 34, UIKit.GREEN, HORIZONTAL_ALIGNMENT_CENTER, 7)
 	else:
@@ -1630,22 +2096,45 @@ func _draw_panel() -> void:
 		"wskin":
 			d1 = "Bullets glow in this skin's color"
 			var w2: String = String(it["w"])
-			d2 = "View only - pick it in FIGHTER SELECT" if not shop_mode else ("Pick it in FIGHTER SELECT after the weapon" if not (w2 == "pistol" or w2 == "knife") else "Pick it in FIGHTER SELECT (backup gun / knife)")
+			d2 = "Upgrade it here - pick it in FIGHTER SELECT" if not shop_mode else ("Pick it in FIGHTER SELECT after the weapon" if not (w2 == "pistol" or w2 == "knife") else "Pick it in FIGHTER SELECT (backup gun / knife)")
 		"acc":
 			d1 = "Fits every character and skin"
 			d2 = "Equip it per character in INVENTORY" if shop_mode else ("Each player + character + skin has its own set" if owned else "Preview only - buy it in the SHOP")
-	UIKit.text_in(self, d1, Rect2(px + 20.0, 520.0, 370.0, 22.0), 15, Color(1, 1, 1, 0.6), HORIZONTAL_ALIGNMENT_CENTER, 3)
-	UIKit.text_in(self, d2, Rect2(px + 20.0, 540.0, 370.0, 22.0), 15, Color(1, 1, 1, 0.45), HORIZONTAL_ALIGNMENT_CENTER, 3)
-	# cap besar (PURCHASED / EQUIPPED)
-	if stamp_t > 0.0:
-		var sp2: float = 1.0 - stamp_t
-		var sc: float = lerpf(2.4, 1.0, CosmeticUI.back(clampf(sp2 * 4.0, 0.0, 1.0)))
-		draw_set_transform(area.get_center(), deg_to_rad(-9.0), Vector2.ONE * sc)
-		var sr := Rect2(-150, -34, 300, 68)
-		draw_rect(sr, Color(0.0, 0.1, 0.05, 0.9 * clampf(stamp_t * 3.0, 0.0, 1.0)))
-		draw_rect(sr, Color(UIKit.GREEN, clampf(stamp_t * 3.0, 0.0, 1.0)), false, 5.0)
-		UIKit.text_in(self, stamp_text, sr, 44, Color(UIKit.GREEN, clampf(stamp_t * 3.0, 0.0, 1.0)), HORIZONTAL_ALIGNMENT_CENTER, 8)
-		draw_set_transform(Vector2.ZERO)
+	var d1c := Color(1, 1, 1, 0.6)
+	var d1s: int = 15
+	var d2s: int = 15
+	if fxp and String(it["kind"]) != "acc":
+		var ld: Array = _lv_desc(it, pv_lv)
+		d1 = String(ld[0])
+		d2 = String(ld[1])
+		d1c = Color(rc.lightened(0.3), 1.0)
+		d1s = 17
+		d2s = _fit(d2, 372.0, 15)
+	elif fxp:
+		d1 = "Animated accessory - fits every character"
+	UIKit.text_in(self, d1, Rect2(px + 20.0, 514.0, 370.0, 22.0), d1s, d1c, HORIZONTAL_ALIGNMENT_CENTER, 3)
+	UIKit.text_in(self, d2, Rect2(px + 20.0, 534.0, 370.0, 22.0), d2s, Color(1, 1, 1, 0.5), HORIZONTAL_ALIGNMENT_CENTER, 3)
+	if fxp and String(it["kind"]) != "acc" and not (upgrade_btn != null and upgrade_btn.visible):
+		var hint: String = "TAB = switch level" + ("   -   X / click preview = replay finisher" if (String(it["kind"]) == "wskin" and pv_lv >= 3) else "")
+		UIKit.text_in(self, hint, Rect2(px + 10.0, 553.0, 390.0, 16.0), 12, Color(1, 1, 1, 0.34), HORIZONTAL_ALIGNMENT_CENTER, 2)
+
+
+## Cap besar (PURCHASED / UPGRADED / EQUIPPED). Digambar oleh StampLayer supaya tampil DI DEPAN karakter / senjata preview.
+func _draw_stamp(ci: CanvasItem) -> void:
+	if stamp_t <= 0.0 or panel_item().is_empty():
+		return
+	var e: float = CosmeticUI.ease_out(clampf((_intro - 0.1) / 0.5, 0.0, 1.0))
+	var px: float = PANEL_X + (1.0 - e) * 420.0
+	var area := Rect2(px + 24.0, 170.0, 362.0, 296.0)
+	var a: float = clampf(stamp_t * 3.0, 0.0, 1.0)
+	var sp2: float = 1.0 - stamp_t
+	var sc: float = lerpf(2.4, 1.0, CosmeticUI.back(clampf(sp2 * 4.0, 0.0, 1.0)))
+	ci.draw_set_transform(area.get_center(), deg_to_rad(-9.0), Vector2.ONE * sc)
+	var sr := Rect2(-150, -34, 300, 68)
+	ci.draw_rect(sr, Color(0.0, 0.1, 0.05, 0.9 * a))
+	ci.draw_rect(sr, Color(UIKit.GREEN, a), false, 5.0)
+	UIKit.text_in(ci, stamp_text, sr, 44, Color(UIKit.GREEN, a), HORIZONTAL_ALIGNMENT_CENTER, 8)
+	ci.draw_set_transform(Vector2.ZERO)
 
 
 func _fit(s: String, maxw: float, fs: int) -> int:
@@ -1676,8 +2165,8 @@ func _dp(delay: float, dur: float) -> float:
 
 func _item_sub(it: Dictionary) -> String:
 	match String(it["kind"]):
-		"cskin": return "%s SKIN" % Global.character_name(0, int(it["ch"]))
-		"wskin": return "%s SKIN" % String(Global.WEAPONS[String(it["w"])]["name"])
+		"cskin": return "%s SKIN%s" % [Global.character_name(0, int(it["ch"])), (" - UPGRADE TO LV%d" % int(it["upgrade_to"])) if it.has("upgrade_to") else ""]
+		"wskin": return "%s SKIN%s" % [String(Global.WEAPONS[String(it["w"])]["name"]), (" - UPGRADE TO LV%d" % int(it["upgrade_to"])) if it.has("upgrade_to") else ""]
 		"acc": return "%s ACCESSORY" % String(Cosmetics.SLOT_NAMES[String(it["slot"])])
 	return ""
 
@@ -1796,7 +2285,7 @@ func _draw_dialog(ci: CanvasItem) -> void:
 	for poly in _dlg_clip(pts, head):
 		ci.draw_colored_polygon(poly, Color(rc.darkened(0.5), 0.95 * ha))
 	ci.draw_line(Vector2(box.position.x + 17.0, head.end.y), Vector2(box.end.x - 3.0, head.end.y), Color(bcol, ha), 3.0)
-	var title := "CONFIRM PURCHASE"
+	var title := "CONFIRM UPGRADE" if dlg_item.has("upgrade_to") else "CONFIRM PURCHASE"
 	var ttw: float = UIKit.text_w(title, 26)
 	UIKit.text_in(ci, title, Rect2(box.position.x, head.position.y + (1.0 - ha) * -14.0, box.size.x, 46.0), 26, Color(1, 1, 1, ha), HORIZONTAL_ALIGNMENT_CENTER, 6)
 	CosmeticUI.draw_coin(ci, Vector2(ctr.x - ttw * 0.5 - 30.0, head.position.y + 23.0), 28.0, t, true, ha)
@@ -1854,7 +2343,7 @@ func _draw_dialog(ci: CanvasItem) -> void:
 	var cnt: float = CosmeticUI.ease_out(clampf((dlg_age - 0.6) / 0.8, 0.0, 1.0))
 	var after_v: int = int(round(lerpf(float(dlg_bal), float(dlg_bal - pr), cnt)))
 	var after_col: Color = Color(1, 1, 1, 1).lerp(UIKit.GREEN, cnt)
-	_dlg_row(ci, "AFTER BUYING", after_v, box.position.y + 236.0, ix, iw, 44.0, 36, after_col, aaf, 34.0)
+	_dlg_row(ci, "AFTER UPGRADE" if dlg_item.has("upgrade_to") else "AFTER BUYING", after_v, box.position.y + 236.0, ix, iw, 44.0, 36, after_col, aaf, 34.0)
 
 	# ---- tombol YES / CANCEL
 	var bta: float = _dp(0.5, 0.4)
@@ -1897,7 +2386,7 @@ func _draw_dialog(ci: CanvasItem) -> void:
 		else:
 			ci.draw_line(ic + Vector2(-9, -9), ic + Vector2(9, 9), icol, 5.0, true)
 			ci.draw_line(ic + Vector2(-9, 9), ic + Vector2(9, -9), icol, 5.0, true)
-		var lbl: String = "BUY" if yes else "CANCEL"
+		var lbl: String = ("UPGRADE" if dlg_item.has("upgrade_to") else "BUY") if yes else "CANCEL"
 		var lr := Rect2(br.position.x + 64.0, br.position.y, br.size.x - 84.0, br.size.y)
 		UIKit.text_in(ci, lbl, lr, _fit(lbl, lr.size.x, 30), icol, HORIZONTAL_ALIGNMENT_CENTER, 6, Color(0, 0, 0, alpha))
 	ci.draw_set_transform_matrix(xf)
@@ -1960,7 +2449,7 @@ class GridView extends Control:
 		var its: Array = ui.items()
 		var cs: Vector2 = ui.card_size()
 		var cn: int = ui.cols()
-		var on_grid: bool = ui.row == ui.grid_row() and not ui.back_focus
+		var on_grid: bool = ui.row == ui.grid_row() and not ui.back_focus and ui.panel_focus == 0
 		var n: int = its.size()
 		var stag: float = minf(0.04, 0.5 / maxf(float(n), 1.0))
 		var late: int = -1
@@ -2080,6 +2569,17 @@ class GridView extends Control:
 					Cosmetics.draw_preview(self, pc, "" if ui.shop_mode else ui.cur_skin_id(), lo, face, tint)
 		if not owned and not ui.shop_mode:
 			UIKit.draw_lock(self, th.get_center(), 30.0, Color(1, 1, 1, 0.85))
+		# level premium: 3 titik LV1-3 (terisi = level yang dimiliki) / tanda animasi
+		var mxl: int = int(it.get("maxlv", 1))
+		var kd2: String = String(it["kind"])
+		if mxl > 1 and (kd2 == "cskin" or kd2 == "wskin"):
+			var lvo: int = int(it.get("lv", 0)) if owned else 0
+			for pi in 3:
+				var pcn: Vector2 = th.position + Vector2(14.0 + float(pi) * 14.0, th.size.y - 12.0)
+				draw_circle(pcn, 6.0, Color(0, 0, 0, 0.8))
+				draw_circle(pcn, 4.2, rc.lightened(0.3) if pi < lvo else Color(1, 1, 1, 0.2))
+		elif kd2 == "acc" and bool(it.get("fx", false)):
+			UIKit.text_in(self, "ANIMATED", Rect2(th.position.x + 4.0, th.end.y - 20.0, th.size.x - 8.0, 16.0), 12, Color(rc.lightened(0.45), 0.95), HORIZONTAL_ALIGNMENT_LEFT, 3)
 		# rarity pip
 		draw_colored_polygon(_g_pip, Color(rc, 0.95))
 		# nama + harga / status
@@ -2095,7 +2595,10 @@ class GridView extends Control:
 		if is_pick:
 			UIKit.text_in(self, "SKINS %d/%d" % [int(it["have"]), int(it["total"])], Rect2(o.x, py, w, 22.0), 15, UIKit.CYAN, HORIZONTAL_ALIGNMENT_CENTER, 3)
 		elif ui.shop_mode:
-			if owned:
+			if owned and mxl > 1:
+				var maxed: bool = int(it["lv"]) >= mxl
+				UIKit.text_in(self, "MAX LV" if maxed else "LV %d/%d  UPGRADE" % [int(it["lv"]), mxl], Rect2(o.x, py, w, 22.0), 16 if maxed else 14, UIKit.GREEN if maxed else UIKit.GOLD, HORIZONTAL_ALIGNMENT_CENTER, 4)
+			elif owned:
 				UIKit.text_in(self, "OWNED", Rect2(o.x, py, w, 22.0), 16, UIKit.GREEN, HORIZONTAL_ALIGNMENT_CENTER, 4)
 			else:
 				var pr: int = int(it["price"])
@@ -2113,6 +2616,8 @@ class GridView extends Control:
 				UIKit.text_in(self, "LOCKED", Rect2(o.x, py, w, 22.0), 15, Color(1, 1, 1, 0.4), HORIZONTAL_ALIGNMENT_CENTER, 3)
 			elif equipped:
 				UIKit.text_in(self, "EQUIPPED", Rect2(o.x, py, w, 22.0), 15, UIKit.GREEN, HORIZONTAL_ALIGNMENT_CENTER, 4)
+			elif mxl > 1:
+				UIKit.text_in(self, "LEVEL %d/%d" % [int(it["lv"]), mxl], Rect2(o.x, py, w, 22.0), 15, UIKit.CYAN, HORIZONTAL_ALIGNMENT_CENTER, 3)
 			else:
 				UIKit.text_in(self, "OWNED", Rect2(o.x, py, w, 22.0), 15, Color(1, 1, 1, 0.6), HORIZONTAL_ALIGNMENT_CENTER, 3)
 		if owned and (equipped and not ui.shop_mode):
@@ -2170,6 +2675,22 @@ class GlyphWarm extends Control:
 			if ol > 0:
 				draw_string_outline(f, Vector2(0.0, 60.0), txt, HORIZONTAL_ALIGNMENT_LEFT, -1, fs, ol, Color.BLACK)
 			draw_string(f, Vector2(0.0, 60.0), txt, HORIZONTAL_ALIGNMENT_LEFT, -1, fs, Color.WHITE)
+
+
+# ================================================================== lapisan cap (di atas preview karakter / senjata)
+class StampLayer extends Control:
+	var ui: CosmeticUI
+
+	func _init() -> void:
+		set_anchors_preset(Control.PRESET_FULL_RECT)
+		mouse_filter = Control.MOUSE_FILTER_IGNORE
+
+	func _ready() -> void:
+		size = Vector2(CosmeticUI.W, CosmeticUI.H)
+
+	func _draw() -> void:
+		if ui != null:
+			ui._draw_stamp(self)
 
 
 # ================================================================== lapisan dialog (di atas semua anak lain)

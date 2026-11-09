@@ -183,6 +183,7 @@ var fullscreen: bool = false
 var screen_shake: bool = true
 var show_fps: bool = false          # tampilkan counter FPS di pojok kiri bawah layar
 var fps_limit: int = 60             # salah satu dari FPS_OPTIONS (0 = Unlimited)
+var cursor_color: int = 0           # indeks warna kursor (lihat GameCursor.PALETTES), diatur di SETTINGS > CURSOR COLOR
 
 var key_bindings: Array = []        # 4 Dictionary {aksi: kode keyboard}
 var pad_bindings: Array = []        # 4 Dictionary {aksi: kode tombol controller}
@@ -506,13 +507,16 @@ func _start_asset_preload() -> void:
 	_pre_queue.append(HUB_SCENE)
 	# 1) sfx (urutan ekstensi sama seperti get_sfx: mp3, wav, ogg)
 	var found := {}   # nama -> {ext: true}
-	for f in _list_res_files("res://assets/sfx"):
-		var ext2: String = f.get_extension().to_lower()
-		if ext2 == "mp3" or ext2 == "wav" or ext2 == "ogg":
-			var nm: String = f.get_basename()
-			if not found.has(nm):
-				found[nm] = {}
-			found[nm][ext2] = f   # simpan nama file ASLI (ada yang berekstensi huruf besar, mis. round_10.WAV)
+	for sub in ["", "voice"]:      # folder voice (suara karakter / senjata) ikut dimuat: dulu dibaca dari disk saat dipakai
+		var dir_sfx: String = "res://assets/sfx" if sub == "" else "res://assets/sfx/%s" % sub
+		var pre_sfx: String = "" if sub == "" else "%s/" % sub
+		for f in _list_res_files(dir_sfx):
+			var ext2: String = f.get_extension().to_lower()
+			if ext2 == "mp3" or ext2 == "wav" or ext2 == "ogg":
+				var nm: String = pre_sfx + f.get_basename()
+				if not found.has(nm):
+					found[nm] = {}
+				found[nm][ext2] = pre_sfx + f   # simpan nama file ASLI (ada yang berekstensi huruf besar, mis. round_10.WAV)
 	for nm2 in found:
 		for ext3 in ["mp3", "wav", "ogg"]:
 			if found[nm2].has(ext3):
@@ -1008,6 +1012,27 @@ func team_nerf(team: int) -> Dictionary:
 
 
 # ------------------------------------------------------------------ scene
+var _visited_scenes := {}
+const SETTLE_GOOD_FRAMES := 3
+const SETTLE_MAX_FRAME_US := 24000
+const SETTLE_MAX_MSEC := 350
+
+
+## Menunggu sampai beberapa frame berturut-turut lancar (maks. SETTLE_MAX_MSEC), dipakai saat layar tertutup.
+func _settle_frames() -> void:
+	var t0: int = Time.get_ticks_msec()
+	var last: int = Time.get_ticks_usec()
+	var good: int = 0
+	while good < SETTLE_GOOD_FRAMES and Time.get_ticks_msec() - t0 < SETTLE_MAX_MSEC:
+		await get_tree().process_frame
+		var now: int = Time.get_ticks_usec()
+		if now - last <= SETTLE_MAX_FRAME_US:
+			good += 1
+		else:
+			good = 0
+		last = now
+
+
 func goto(scene_name: String) -> void:
 	if _changing:
 		return
@@ -1018,6 +1043,9 @@ func goto(scene_name: String) -> void:
 	get_tree().change_scene_to_file("res://scenes/%s.tscn" % scene_name)
 	await get_tree().process_frame
 	await get_tree().process_frame
+	if not _visited_scenes.has(scene_name):
+		_visited_scenes[scene_name] = true
+		await _settle_frames()         # kunjungan pertama: hitch sisa terjadi SELAGI layar masih tertutup
 	await _transition.reveal()
 	_changing = false
 
@@ -1554,7 +1582,10 @@ func _make_slash_stream() -> AudioStreamWAV:
 ## Pakai:  Global.prewarm_synth()  -> mulai membangun (aman dipanggil berkali-kali; sudah otomatis dipanggil di _ready)
 ##         Global.play_synth("clear_fanfare", -4.0)  -> true kalau sudah siap dan terdengar
 const SYNTH_IDS := ["clear_boom", "coin", "whistle", "pop", "applause", "vic_riser", "vic_crash", "chime",
-		"stab", "shimmer", "clear_fanfare", "vic_anthem"]   # urutan = dari yang ringan ke yang berat; vic_*: animasi kemenangan VERSUS (game.gd)
+		"stab", "shimmer", "clear_fanfare", "vic_anthem",
+		"fin_blackhole", "fin_lightning", "fin_inferno", "fin_glitch", "fin_shatter", "fin_ascend", "fin_petals",
+		"fin_cosmic", "fin_toxic", "fin_jackpot", "fin_slice",
+		"fin_meteor", "fin_tsunami", "fin_reaper", "fin_portal", "fin_sands", "fin_firework", "fin_orbital", "fin_hex", "fin_balloon", "fin_ufo"]   # urutan = dari yang ringan ke yang berat; vic_*: animasi kemenangan VERSUS (game.gd); fin_*: suara FINISHER (finisher_synth.gd)
 const SYNTH_CHUNK := 2600           # sampel per potongan kerja (dipakai thread latar belakang)
 const SYNTH_YIELD_MS := 3           # jeda (ms) tiap potongan: thread tidak memakan 100% satu core -> game tidak patah-patah
 const SYNTH_CACHE_VER := 1          # NAIK-kan angka ini kalau Anda mengubah rumus suara _syn_* (supaya cache disk dibuat ulang)
@@ -1596,6 +1627,13 @@ func synth_ready() -> bool:
 
 func has_synth(id: String) -> bool:
 	return _synth_cache.has(id)
+
+
+## Ambil suara sintetis yang sudah jadi (null kalau belum siap). Dipakai Finisher (finisher.gd) untuk memutar suaranya sendiri.
+func get_synth(id: String) -> AudioStreamWAV:
+	if _synth_cache.has(id):
+		return _synth_cache[id]
+	return null
 
 
 func play_synth(id: String, volume_db: float = 0.0, pitch: float = 1.0, bus: String = "SFX") -> bool:
@@ -1680,6 +1718,8 @@ func _synth_load_disk(id: String) -> AudioStreamWAV:
 
 
 func _synth_spec(id: String) -> Dictionary:
+	if FinisherSynth.is_id(id):
+		return FinisherSynth.spec(id)
 	match id:
 		"clear_boom": return {"rate": 22050, "dur": 1.9}
 		"clear_fanfare": return {"rate": 32000, "dur": 3.6}
@@ -1730,6 +1770,9 @@ func _synth_build_sync(id: String) -> AudioStreamWAV:
 
 
 func _synth_fill(id: String, buf: PackedFloat32Array, i0: int, i1: int, rate: int, ctx: Dictionary) -> void:
+	if FinisherSynth.is_id(id):
+		FinisherSynth.fill(id, buf, i0, i1, rate, ctx)
+		return
 	match id:
 		"clear_boom": _syn_boom(buf, i0, i1, rate, ctx)
 		"clear_fanfare": _syn_fanfare(buf, i0, i1, rate, ctx)
@@ -2123,6 +2166,7 @@ func _capture_settings() -> Dictionary:
 		"shake": screen_shake,
 		"show_fps": show_fps,
 		"fps_limit": fps_limit,
+		"cursor": cursor_color,
 		"prefs": input_pref.duplicate(),
 		"keys": key_bindings.duplicate(true),
 		"pads": pad_bindings.duplicate(true),
@@ -2162,6 +2206,10 @@ func revert_edit() -> void:
 	fullscreen = bool(snap["fullscreen"])
 	show_fps = bool(snap["show_fps"])
 	fps_limit = int(snap["fps_limit"])
+	cursor_color = int(snap["cursor"])
+	var gc: Node = get_node_or_null("/root/GameCursor")
+	if gc != null:
+		gc.call("set_palette", cursor_color)     # kembalikan warna kursor ke yang tersimpan
 	set_music_volume(float(snap["music"]))
 	set_sfx_volume(float(snap["sfx"]))
 	for i in 4:
@@ -2224,6 +2272,7 @@ func _load_settings() -> void:
 		show_fps = bool(cfg.get_value("display", "show_fps", show_fps))
 		var fl: int = int(cfg.get_value("display", "fps_limit", fps_limit))
 		fps_limit = fl if FPS_OPTIONS.has(fl) else 60
+		cursor_color = maxi(int(cfg.get_value("display", "cursor_color", cursor_color)), 0)
 		for i in 4:
 			var pref: Variant = cfg.get_value("input", "device_p%d" % (i + 1), PREF_AUTO)
 			input_pref[i] = int(pref) if pref is int and int(pref) >= PREF_AUTO else PREF_AUTO
@@ -2246,6 +2295,7 @@ func save_settings() -> void:
 	cfg.set_value("display", "screen_shake", screen_shake)
 	cfg.set_value("display", "show_fps", show_fps)
 	cfg.set_value("display", "fps_limit", fps_limit)
+	cfg.set_value("display", "cursor_color", cursor_color)
 	for i in 4:
 		cfg.set_value("input", "device_p%d" % (i + 1), input_pref[i])
 		for a in ACTIONS:

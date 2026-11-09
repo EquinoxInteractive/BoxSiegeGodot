@@ -10,6 +10,7 @@ extends Control
 ##   4) SHOP & INVENTORY: tekstur skin / aksesori + scene                      (Cosmetics.warm_*)
 ##   5) Huruf berkontur (menu, shop, About) dimasukkan ke atlas font          (CosmeticUI.GlyphWarm, AboutUI.GlyphWarmer)
 ##   6) Shader GPU (additive, garis halus, poligon, partikel, latar menu)      (Global.boot_gpu_warm)
+##   7) CAMPAIGN: huruf peta/level/banner, shader kalah & skin, peta dijalankan sekali  (scripts/boot_warm.gd)
 ## Begitu semuanya selesai, game masuk ke menu dan seluruh game berjalan mulus (tanpa memuat apa pun lagi).
 ##
 ## Tampilan: latar prosedural (matahari terbit di atas benteng kotak + grid neon), kubus 3D melayang, bara api,
@@ -41,12 +42,13 @@ const OUT_UI_DUR := 0.50             # lama bar / logo / tips / karakter keluar 
 const OUT_PORTAL := 0.78             # portal mulai membesar (zoom). Durasi zoom & buka ada di PortalFx.COVER_DUR / REVEAL_DUR
 
 # bobot kemajuan tiap langkah (jumlah = 1.0)
-const W_PRE := 0.44                  # aset
+const W_PRE := 0.38                  # aset
 const W_SYN := 0.08                  # suara sintetis
-const W_CAM := 0.18                  # peta CAMPAIGN
-const W_COS := 0.10                  # SHOP & INVENTORY
+const W_CAM := 0.16                  # peta CAMPAIGN
+const W_COS := 0.09                  # SHOP & INVENTORY
 const W_GLY := 0.07                  # huruf
-const W_GPU := 0.13                  # shader GPU
+const W_GPU := 0.11                  # shader GPU
+const W_WRM := 0.11                  # pemanasan CAMPAIGN (huruf, shader, peta)
 
 const TIP_TIME := 4.2                # lama tiap tips tampil (detik)
 const TIPS := [
@@ -240,7 +242,9 @@ var _gly_p: float = 0.0
 var _gpu_p: float = 0.0
 var _gpu_frames: int = 0
 var _gpu_done: bool = false
-var _phase: int = 0                  # 0 aset, 1 kosmetik, 2 huruf, 3 shader, 4 suara, 5 siap
+var _phase: int = 0                  # 0 aset, 1 kosmetik, 2 huruf, 3 shader, 4 campaign, 5 suara, 6 siap
+var _wrm_p: float = 0.0
+var _font_warm: BootWarm.FontWarm = null
 var _cos_gw: Node = null
 var _about_gw: Node = null
 var _about_done: bool = false
@@ -300,6 +304,8 @@ func _boot() -> void:
 	AboutUI.preload_assets()                  # logo + font halaman About
 	CosmeticUI.menu_warm_begin(self)          # susun antrean SHOP / INVENTORY (+ penanda pemanasan huruf)
 	_cos_total = maxi(Cosmetics._warm_q.size(), 1)
+	_font_warm = BootWarm.FontWarm.new(BootWarm.font_jobs())   # huruf CAMPAIGN: berjalan bersamaan dengan pemuatan aset
+	add_child(_font_warm)
 	for c in get_children():
 		if c is CosmeticUI.GlyphWarm:
 			_cos_gw = c
@@ -342,12 +348,32 @@ func _boot() -> void:
 	await _wait_until(func() -> bool: return _gpu_done, 8.0)
 	_gpu_p = 1.0
 
-	# ---- 5) suara sintetis (biasanya sudah selesai sejak tadi)
+	# ---- 5) CAMPAIGN: huruf, shader, peta dijalankan sekali di luar layar
 	_phase = 4
+	await _run_campaign_warm()
+	_wrm_p = 1.0
+
+	# ---- 6) suara sintetis (biasanya sudah selesai sejak tadi)
+	_phase = 5
 	await _wait_until(func() -> bool: return Global.synth_ready(), STEP_TIMEOUT)
 
-	_phase = 5
+	_phase = 6
 	_all_done = true
+
+
+## Pemanasan CAMPAIGN: sisa huruf, shader & primitif, lalu peta CAMPAIGN dijalankan sekali (tersembunyi). Lihat boot_warm.gd.
+func _run_campaign_warm() -> void:
+	await _wait_until(func() -> bool: return not is_instance_valid(_font_warm) or _font_warm.done, 25.0)
+	if is_instance_valid(_font_warm):
+		_font_warm.queue_free()
+	_wrm_p = 0.40
+	var pw := BootWarm.PrimWarm.new()
+	add_child(pw)
+	await _wait_until(func() -> bool: return pw.done, 6.0)
+	pw.queue_free()
+	_wrm_p = 0.55
+	await BootWarm.warm_hub(self)
+	_wrm_p = 1.0
 
 
 func _wait_until(cond: Callable, timeout: float) -> void:
@@ -409,7 +435,10 @@ func _poll() -> void:
 	var gpu: float = _gpu_p
 	if _phase == 3 and not _gpu_done:
 		gpu = minf(float(_gpu_frames) / 22.0, 0.95)
-	var tot: float = W_PRE * pre + W_SYN * syn + W_CAM * cam + W_COS * _cos_p + W_GLY * _gly_p + W_GPU * gpu
+	var wrm: float = _wrm_p
+	if _phase < 4 and is_instance_valid(_font_warm):
+		wrm = 0.40 * _font_warm.progress()
+	var tot: float = W_PRE * pre + W_SYN * syn + W_CAM * cam + W_COS * _cos_p + W_GLY * _gly_p + W_GPU * gpu + W_WRM * wrm
 	if _all_done:
 		tot = 1.0
 	_target = maxf(_target, minf(tot, 1.0))
@@ -433,6 +462,9 @@ func _poll() -> void:
 	elif _phase == 3:
 		txt = "COMPILING VISUAL EFFECTS"
 	elif _phase == 4:
+		txt = "PREPARING CAMPAIGN"
+		cnt = "%d%%" % int(wrm * 100.0)
+	elif _phase == 5:
 		txt = "SYNTHESIZING SOUNDS"
 		cnt = "%d%%" % int(syn * 100.0)
 	else:

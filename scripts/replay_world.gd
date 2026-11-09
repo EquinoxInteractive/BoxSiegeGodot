@@ -42,6 +42,9 @@ var _last_hp: Array = []
 var _last_weapon: Array = []
 var _last_knife: Array = []
 var _last_vanished: Array = []
+var fin_events: Array = []             # event finisher (skin senjata LV3) dari rekaman
+var _fin_nodes: Dictionary = {}        # indeks event -> Finisher yang sedang tampil
+var _fin_hide: Array = []              # per pemain: korban finisher disembunyikan (digantikan animasi finisher)
 var _sfx_gap: Dictionary = {}
 
 var cur_i: int = 0                     # indeks snapshot yang sedang ditampilkan
@@ -77,6 +80,9 @@ func build(data: Dictionary) -> bool:
 	for i in starts.size():
 		times[i] = flat[starts[i]]
 	duration = times[times.size() - 1]
+	for e in data.get("events", []):
+		if String((e as Dictionary).get("type", "")) == "finisher":
+			fin_events.append(e)
 
 	_build_world()
 	_build_actors()
@@ -234,7 +240,9 @@ func _build_actors() -> void:
 		var p := Player.new()
 		players_root.add_child(p)
 		p.setup(int(pd["index"]), int(pd["char"]), String(pd["weapon"]), self)
-		p.apply_cosmetics(String(pd.get("skin", "")), pd.get("wskins", {}), pd.get("loadout", {}))
+		p.apply_cosmetics(String(pd.get("skin", "")), pd.get("wskins", {}), pd.get("loadout", {}),
+			{"skin": int(pd.get("skin_lv", 1)), "w": pd.get("wskin_lv", {})})
+		_fin_hide.append(false)
 		if team_mode:
 			p.apply_team_balance(int(pd["team"]), pd["team_color"], int(pd.get("team_level", 0)), {})
 		p.set_physics_process(false)
@@ -296,6 +304,7 @@ func apply(t: float, fx_ok: bool) -> void:
 	_b = starts[j]
 	_k = k
 
+	_apply_finishers(t)
 	var P: int = ReplayRecorder.PS
 	for n in p_count:
 		_apply_player(n, fx_ok)
@@ -321,6 +330,57 @@ func apply(t: float, fx_ok: bool) -> void:
 			cp.art.modulate = Color(1.0, 0.93, 0.82, alpha)
 	off += c_count * 2
 	_apply_objects(off, fx_ok)
+
+
+## Finisher kill terakhir: waktunya DIKUNCI ke waktu replay (jeda / geser / kecepatan otomatis benar).
+func _apply_finishers(t: float) -> void:
+	for n in _fin_hide.size():
+		_fin_hide[n] = false
+	for i in fin_events.size():
+		var e: Dictionary = fin_events[i]
+		var dt: float = t - float(e["t"])
+		var vi: int = int(e["victim"])
+		if dt >= 0.0 and dt < Finisher.D + 0.5 and vi >= 0 and vi < _fin_hide.size():
+			if not actors[vi].alive or dt < 0.2:
+				_fin_hide[vi] = true
+		if dt >= 0.0 and dt < Finisher.D:
+			var f: Finisher = _fin_nodes.get(i, null)
+			if f == null or not is_instance_valid(f):
+				f = _make_finisher(e)
+				if f == null:
+					continue
+				_fin_nodes[i] = f
+			f.t = dt
+			f.sfx_on = sound_on          # suara finisher ikut pengaturan efek suara Replay (mati saat dijeda / digeser / kecepatan tinggi)
+			f.refresh()
+		elif _fin_nodes.has(i):
+			var old: Finisher = _fin_nodes[i]
+			if is_instance_valid(old):
+				old.queue_free()
+			_fin_nodes.erase(i)
+
+
+func _make_finisher(e: Dictionary) -> Finisher:
+	var info: Dictionary = FxCatalog.weapon_info(String(e["sid"]))
+	if info.is_empty():
+		return null
+	var vi: int = int(e["victim"])
+	var f := Finisher.new()
+	f.kind = String(e["fin"])
+	f.c1 = info["c1"]
+	f.c2 = info["c2"]
+	f.weapon = String(e["wid"])
+	var winfo: Array = Cosmetics.weapon_skin_info(f.weapon, String(e["sid"]))
+	f.title = String(winfo[1]) if winfo.size() > 1 else ""
+	f.victim_tex = actors[vi].portrait_tex(true)
+	f.vpos = Vector2(float(e["vx"]), float(e["vy"]))
+	f.kpos = Vector2(float(e["kx"]), float(e["ky"]))
+	f.usize = Player.SIZE * actors[vi].size_mult
+	f.manual = true
+	f.show_text = false          # sama seperti ingame: tanpa teks banner finisher
+	f.view = self                # zoom kamera ke korban (dunia replay di-zoom lewat transform)
+	add_child(f)
+	return f
 
 
 func _lerp_v2(rel: int) -> Vector2:
@@ -364,7 +424,7 @@ func _apply_player(n: int, fx_ok: bool) -> void:
 	_last_hp[n] = hp
 	p.hp = hp
 	p.alive = alive          # dibaca HUD asli (potret K.O., kartu redup)
-	p.visible = not vanished
+	p.visible = not vanished and not bool(_fin_hide[n])
 
 	# senjata yang dipegang
 	var wi: int = int(flat[pa + ReplayRecorder.PL_WEAPON])
@@ -569,6 +629,7 @@ func _make_bullet(dir: int, wid: String, shooter: int) -> Bullet:
 	if shooter >= 0 and shooter < plist.size():
 		var ws: Dictionary = (plist[shooter] as Dictionary).get("wskins", {})
 		bu.skin_color = Cosmetics.bullet_color(wid, String(ws.get(wid, "")))
+		Cosmetics.apply_bullet_fx(bu, wid, String(ws.get(wid, "")), int(((plist[shooter] as Dictionary).get("wskin_lv", {}) as Dictionary).get(wid, 1)))
 	bullets_root.add_child(bu)
 	bu.set_physics_process(false)
 	bu.collision_mask = 0

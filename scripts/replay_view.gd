@@ -332,6 +332,17 @@ func _update_hud() -> void:
 	_snap_pending = false
 
 
+## True kalau ronde (mulai rs, selesai re) diakhiri finisher.
+func _round_has_finisher(rs: float, re: float) -> bool:
+	if world == null or re < 0.0:
+		return false
+	for e in world.fin_events:
+		var ft: float = float((e as Dictionary)["t"])
+		if ft >= rs - 0.01 and ft <= re + 0.05:
+			return true
+	return false
+
+
 ## Banner besar ROUND / FINAL ROUND / FIGHT! / SUDDEN DEATH! / WINS! memakai BannerFx milik game (animasi sama).
 func _update_banner() -> void:
 	var text: String = ""
@@ -368,10 +379,12 @@ func _update_banner() -> void:
 		# menang match: tanpa banner (sama seperti game, langsung ke animasi kemenangan)
 		if re >= 0.0 and t >= re and t < re + 2.6 and int(r["winner"]) != -2 and not bool(round_match_end[i]):
 			if int(r["winner"]) >= 0:
-				text = "%s WINS!" % String(r["winner_label"])
-				col = r["winner_color"]
-				fsize = 80
-				key = "win:%d" % i
+				# sama seperti game: ronde yang diakhiri finisher tidak menampilkan teks "X WINS!"
+				if not _round_has_finisher(rs, re):
+					text = "%s WINS!" % String(r["winner_label"])
+					col = r["winner_color"]
+					fsize = 80
+					key = "win:%d" % i
 			else:
 				text = "DRAW!"
 				col = Color.WHITE
@@ -473,6 +486,8 @@ func _process(delta: float) -> void:
 	for h in huds:
 		h.visible = show_hud          # tombol PLAYER CARDS bekerja juga saat video dijeda
 	world.fx_root.process_mode = Node.PROCESS_MODE_INHERIT if (playing and not ended) else Node.PROCESS_MODE_DISABLED
+	# partikel / animasi skin & aksesoris ikut jeda dan kecepatan replay
+	get_tree().call_group("cos_fx", "set_fx_speed", spd if (playing and not dragging and not ended) else 0.0)
 
 	_sync_panels(delta)
 

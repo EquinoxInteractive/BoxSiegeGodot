@@ -14,6 +14,9 @@ var weapon: String = "smith"
 var max_range: float = 0.0       # 0 = tanpa batas jarak
 var travelled: float = 0.0
 var skin_color: Color = Color(0, 0, 0, 0)   # warna peluru dari skin senjata (alpha 0 = pakai warna asli)
+var fx_fam: String = ""                       # skin senjata premium LV2+: jejak partikel peluru (keluarga efek)
+var fx_c1: Color = Color.WHITE
+var fx_c2: Color = Color.WHITE
 
 
 func setup(d: int, spd: float, dmg: float, shooter_idx: int, weapon_id: String = "smith", rng_px: float = 0.0) -> void:
@@ -41,6 +44,9 @@ func _ready() -> void:
 		art.col = skin_color
 		art.glow = skin_color.lightened(0.3)
 	art.tex = Global.cached_tex("res://assets/sprites/guns/bullet.png")
+	art.fx_fam = fx_fam
+	art.fx_c1 = fx_c1
+	art.fx_c2 = fx_c2
 
 	var shape_size := Vector2(22, 8)
 	var shape_off := Vector2.ZERO
@@ -112,7 +118,7 @@ func _on_body_entered(body: Node) -> void:
 		return
 	if team >= 0 and p.team == team:
 		return
-	p.take_damage(damage, dir, false, true, shooter)
+	p.take_damage(damage, dir, false, true, shooter, weapon)
 	var scene := get_tree().current_scene
 	if scene != null:
 		WeaponFx.impact(scene, global_position, weapon, dir, true)
@@ -130,6 +136,9 @@ class Art extends Node2D:
 	var tint: Color = Color.WHITE
 	var age: float = 0.0
 	var phase: float = 0.0
+	var fx_fam: String = ""
+	var fx_c1: Color = Color.WHITE
+	var fx_c2: Color = Color.WHITE
 
 	func _init() -> void:
 		phase = randf() * 100.0
@@ -146,6 +155,9 @@ class Art extends Node2D:
 				_draw_wave()
 			_:
 				_draw_slug()
+		if fx_fam != "":
+			FxDraw.K = 1.0
+			FxDraw.bullet_fx(self, fx_fam, fx_c1, fx_c2, age + phase)
 
 	## Peluru biasa: jejak bergradien (ekor transparan -> kepala terang) + sprite peluru.
 	func _draw_slug() -> void:

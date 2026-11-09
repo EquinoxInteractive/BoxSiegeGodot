@@ -69,6 +69,10 @@ var char_idx: int = 0
 # ---- kosmetik (skin & aksesoris dari Shop/Inventory); kosong = tampilan asli
 var skin_id: String = ""                  # skin karakter
 var wskins: Dictionary = {}               # weapon_id -> skin_id
+var skin_lv: int = 1                      # level skin karakter (LV2 partikel, LV3 animasi)
+var wskin_lv: Dictionary = {}             # weapon_id -> level skin senjata (LV2 partikel, LV3 finisher)
+var fx_nodes: Array = []                  # node efek premium (partikel skin karakter / senjata)
+var killer_weapon: String = ""            # senjata yang membunuh pemain ini (untuk finisher kill terakhir)
 var loadout_data: Dictionary = {}         # aksesoris yang terpasang (slot -> acc_id), milik pemain ini
 var acc_nodes: Array = []                 # sprite aksesoris yang terpasang
 var weapon_id: String = "smith"      # senjata utama pilihan pemain (smith / kurval / flamer / scream)
@@ -534,14 +538,22 @@ func weapon_tex_for(weapon: String) -> Texture2D:
 
 
 ## Pasang skin + aksesoris dari inventory. Hanya dipanggil untuk pemain manusia (musuh campaign tidak memakai skin).
-func apply_cosmetics(skin: String, weapon_skins: Dictionary, loadout: Dictionary) -> void:
+func apply_cosmetics(skin: String, weapon_skins: Dictionary, loadout: Dictionary, levels: Dictionary = {}) -> void:
 	skin_id = skin
 	wskins = weapon_skins.duplicate()
 	loadout_data = loadout.duplicate()
+	skin_lv = int(levels.get("skin", 1))
+	wskin_lv = (levels.get("w", {}) as Dictionary).duplicate()
 	for n in acc_nodes:
 		if is_instance_valid(n):
 			(n as Node).queue_free()
+	for n in fx_nodes:
+		if is_instance_valid(n):
+			(n as Node).queue_free()
+	body_sprite.material = null
+	fx_nodes = FxRig.attach_char(body_sprite, self, skin, skin_lv)
 	acc_nodes = Cosmetics.attach_accessories(body_sprite, char_idx, loadout)
+	fx_nodes.append_array(FxRig.attach_weapon(self, wskins, wskin_lv))
 	body_sprite.texture = portrait_tex(false)
 	shown_weapon = ""
 	_sync_weapon(false)
@@ -726,7 +738,7 @@ func _knife_strike() -> void:
 		if dx < -14.0 or dx > reach or dy > reach_y:
 			continue
 		var before: float = other.hp
-		other.take_damage(float(w["damage"]) * dmg_out * knife_mult, facing, false, true, index)
+		other.take_damage(float(w["damage"]) * dmg_out * knife_mult, facing, false, true, index, Global.MELEE_WEAPON)
 		if other.hp < before:
 			WeaponFx.stab_hit(p, other.global_position, facing)
 			Global.play_sfx("knife_hit", -4.0, randf_range(0.94, 1.08))
@@ -807,7 +819,7 @@ func _animate_gun(dt: float) -> void:
 # ------------------------------------------------------------------ health
 ## amount boleh pecahan (0.25, 0.5, 1.5 ...). weapon_hit = true untuk peluru / pisau:
 ## tidak memberi "kebal sesaat" supaya senjata cepat seperti Flamer tetap kena tiap peluru.
-func take_damage(amount: float, from_dir: int = 0, ignore_invuln: bool = false, weapon_hit: bool = false, attacker: int = -1) -> void:
+func take_damage(amount: float, from_dir: int = 0, ignore_invuln: bool = false, weapon_hit: bool = false, attacker: int = -1, src_weapon: String = "") -> void:
 	if not alive:
 		return
 	if invuln > 0.0 and not ignore_invuln:
@@ -828,6 +840,7 @@ func take_damage(amount: float, from_dir: int = 0, ignore_invuln: bool = false, 
 	_hit_fx(from_dir, amount)
 	if hp <= 0.001:
 		killer = attacker
+		killer_weapon = src_weapon
 		die()
 	status_changed.emit(self)
 

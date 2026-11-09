@@ -1,7 +1,7 @@
 extends Control
 ## Menu utama bergaya game konsol (PlayStation):
 ##   MAIN -> PLAY / CONTROLS / SETTINGS / QUIT
-##   PLAYERS (pilih 2/3/4 pemain), SETTINGS (musik, sfx, getar, shake, fullscreen, show fps, limit fps, CONTROLS SETUP),
+##   PLAYERS (pilih 2/3/4 pemain), SETTINGS (musik, sfx, getar, shake, fullscreen, show fps, limit fps, warna kursor + preview, CONTROLS SETUP),
 ##   CONTROLS (daftar tombol yang sedang dipakai)
 ##   ABOUT US (tombol di pojok kiri atas menu utama): info studio, tim developer, info teknis, kontak, legal.
 ##     Isi / teks / logo ada di about_data.gd, tampilan di about_ui.gd.
@@ -36,12 +36,14 @@ var about: AboutUI.AboutPanel
 
 const ABOUT_DOCK := 3        # indeks tombol ABOUT US di daftar dock (0 SHOP, 1 INVENTORY, 2 REPLAY, 3 ABOUT US)
 
-const SET_SETUP := 7      # indeks item di layar settings: 0-6 baris setting, 7 CONTROLS SETUP, 8 SAVE, 9 BACK
-const SET_SAVE := 8
-const SET_BACK := 9
+const SET_SETUP := 8      # indeks item di layar settings: 0-7 baris setting, 8 CONTROLS SETUP, 9 SAVE, 10 BACK
+const SET_SAVE := 9
+const SET_BACK := 10
 const SET_ROW_Y := 176.0  # posisi Y baris pertama di layar settings
-const SET_ROW_STEP := 52.0  # jarak antar baris (baris & tombol setinggi 48)
+const SET_ROW_STEP := 46.0  # jarak antar baris (baris & tombol setinggi 44)
+const SET_ROW_H := 44.0     # tinggi baris & tombol di layar settings
 var setting_rows: Array = []
+var cursor_preview: CursorPreview
 var save_btn: UIKit.FancyButton
 var unsaved_banners: Array = []
 var _discard_until: int = 0
@@ -321,13 +323,14 @@ func _build_settings() -> void:
 		["FULLSCREEN", "toggle", 1.0 if Global.fullscreen else 0.0],
 		["SHOW FPS", "toggle", 1.0 if Global.show_fps else 0.0],
 		["FPS LIMIT", "choice", float(Global.fps_index())],
+		["CURSOR COLOR", "choice", float(Global.cursor_color)],
 	]
 	setting_rows.clear()
 	for i in defs.size():
 		var d: Array = defs[i]
-		var row := UIKit.SettingRow.new(d[0], d[1], float(d[2]), Vector2(740, 48))
+		var row := UIKit.SettingRow.new(d[0], d[1], float(d[2]), Vector2(740, SET_ROW_H))
 		if String(d[1]) == "choice":
-			row.options = Global.fps_option_names()
+			row.options = Global.fps_option_names() if i == 6 else GameCursor.palette_names()
 		row.position = Vector2(270, SET_ROW_Y + i * SET_ROW_STEP)
 		s.add_child(row)
 		items["settings"].append(row)
@@ -335,23 +338,28 @@ func _build_settings() -> void:
 		row.hovered.connect(_hover.bind("settings", i))
 		row.changed.connect(_on_setting_changed.bind(i))
 	# tombol menuju pengaturan kontrol (controller / keyboard + keybind)
-	var setup_btn := UIKit.FancyButton.new("CONTROLS SETUP", Vector2(470, 48), 30)
+	var setup_btn := UIKit.FancyButton.new("CONTROLS SETUP", Vector2(470, SET_ROW_H), 30)
 	setup_btn.tag = "KEYBOARD / CONTROLLER"
 	setup_btn.position = Vector2(270, SET_ROW_Y + defs.size() * SET_ROW_STEP + 4)
 	s.add_child(setup_btn)
 	items["settings"].append(setup_btn)
 	setup_btn.hovered.connect(_hover.bind("settings", SET_SETUP))
 	setup_btn.activated.connect(_open_binds)
+	# kotak PREVIEW warna kursor (di kanan baris setting): langsung berubah saat warna diganti, sebelum SAVE
+	cursor_preview = CursorPreview.new()
+	cursor_preview.position = Vector2(1018, SET_ROW_Y + 6.0)
+	cursor_preview.set_palette(Global.cursor_color)
+	s.add_child(cursor_preview)
 	# SAVE + BACK (sebaris)
 	var y: float = SET_ROW_Y + (defs.size() + 1) * SET_ROW_STEP + 6
-	save_btn = UIKit.FancyButton.new("SAVE", Vector2(350, 48), 32)
+	save_btn = UIKit.FancyButton.new("SAVE", Vector2(350, SET_ROW_H), 32)
 	save_btn.accent = UIKit.GREEN
 	save_btn.position = Vector2(270, y)
 	s.add_child(save_btn)
 	items["settings"].append(save_btn)
 	save_btn.hovered.connect(_hover.bind("settings", SET_SAVE))
 	save_btn.activated.connect(_save_changes)
-	var back := UIKit.FancyButton.new("BACK", Vector2(350, 48), 32)
+	var back := UIKit.FancyButton.new("BACK", Vector2(350, SET_ROW_H), 32)
 	back.position = Vector2(640, y)
 	s.add_child(back)
 	items["settings"].append(back)
@@ -391,6 +399,11 @@ func _on_setting_changed(v: float, i: int) -> void:
 			var oi: int = clampi(int(roundf(v)), 0, Global.FPS_OPTIONS.size() - 1)
 			Global.fps_limit = int(Global.FPS_OPTIONS[oi])
 			Global.apply_fps_limit()
+		7:
+			Global.cursor_color = clampi(int(roundf(v)), 0, GameCursor.PALETTES.size() - 1)
+			GameCursor.set_palette(Global.cursor_color)      # kursor asli langsung berganti warna (belum disimpan)
+			if cursor_preview != null:
+				cursor_preview.set_palette(Global.cursor_color)
 	_refresh_save_state()
 
 
@@ -403,11 +416,14 @@ func _sync_setting_rows() -> void:
 		1.0 if Global.fullscreen else 0.0,
 		1.0 if Global.show_fps else 0.0,
 		float(Global.fps_index()),
+		float(Global.cursor_color),
 	]
 	for i in setting_rows.size():
 		var row: UIKit.SettingRow = setting_rows[i]
 		row.value = float(vals[i])
 		row.queue_redraw()
+	if cursor_preview != null:
+		cursor_preview.set_palette(Global.cursor_color)
 
 
 ## Perbarui tombol SAVE, label UNSAVED, dan tombol SAVE di CONTROLS SETUP sesuai ada / tidaknya perubahan.
@@ -1012,6 +1028,39 @@ class ControlsSheet extends Control:
 			else:
 				UIKit.draw_keys_icon(self, Vector2(cx, 392), 30.0, Color(Global.PLAYER_COLORS[i], 0.8))
 			UIKit.text_in(self, "P%d" % (i + 1), Rect2(cx + 24, 374, 60, 36), 22, Global.PLAYER_COLORS[i], HORIZONTAL_ALIGNMENT_LEFT, 4)
+
+
+# ================================================================== preview warna kursor
+## Kotak PREVIEW di layar SETTINGS: menampilkan kursor (diam & saat klik) dengan warna yang sedang dipilih.
+class CursorPreview extends Control:
+	var pal: int = 0
+
+	func _init() -> void:
+		size = Vector2(236, 320)
+		custom_minimum_size = size
+		mouse_filter = Control.MOUSE_FILTER_IGNORE
+
+	func set_palette(i: int) -> void:
+		pal = i
+		queue_redraw()
+
+	func _draw() -> void:
+		var w: float = size.x
+		var h: float = size.y
+		var pts := UIKit.slanted(w, h, 18.0, 0.0, 0.0)
+		draw_colored_polygon(UIKit.slanted(w, h, 18.0, 5.0, 6.0), Color(0, 0, 0, 0.4))
+		draw_colored_polygon(pts, Color(0.07, 0.07, 0.16, 0.86))
+		draw_polyline(UIKit.closed(pts), UIKit.GOLD, 2.0, true)
+		UIKit.text_in(self, "PREVIEW", Rect2(0, 8, w, 40), 30, UIKit.GOLD, HORIZONTAL_ALIGNMENT_CENTER)
+		var labels: Array[String] = ["IDLE", "CLICK"]
+		for k in 2:
+			var cy: float = 56.0 + float(k) * 128.0
+			var box := Rect2(46.0, cy, 140.0, 100.0)
+			draw_rect(box, Color(0.03, 0.04, 0.1, 0.92))
+			draw_rect(box, Color(1, 1, 1, 0.18), false, 2.0)
+			var tex: Texture2D = GameCursor.texture(pal, k == 1, 96)
+			draw_texture_rect(tex, Rect2(box.position + (box.size - Vector2(96, 96)) * 0.5, Vector2(96, 96)), false)
+			UIKit.text_in(self, labels[k], Rect2(box.position.x, cy + 100.0, box.size.x, 22), 20, Color(1, 1, 1, 0.75), HORIZONTAL_ALIGNMENT_CENTER)
 
 
 # ================================================================== posters hiasan
